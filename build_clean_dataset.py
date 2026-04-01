@@ -271,7 +271,6 @@ def load_codebook_annotated(prefix: str, codebook_dir: str):
         print(f"   ⚠  Codebook non chargé : {e}")
         return None
 
-
 def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.DataFrame:
     """
     Construit un dataset frame-level à partir de debug_encounters uniquement.
@@ -282,6 +281,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
       - proportions de VRU_TYPE
       - proportions de INTERACTION_TYPE
       - labels contextuels dominants / première valeur disponible
+      - start_crossing = 1 sur la première frame d'un crossing piéton
     """
     if df_codebook is None or df_codebook.empty:
         return pd.DataFrame(columns=["frame"])
@@ -298,8 +298,9 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
     numeric_cols = [
         "FRAME_START", "FRAME_END", "VRU_TYPE", "INTERACTION_TYPE",
         "VRU_AGE_GROUP", "VRU_GAIT", "VRU_GROUP_SIZE",
-        "WEATHER", "LIGHTING", "SURFACE_CONDITION", "ZONE_TYPE",
-        "VISUAL_SEGREGATION", "RIDING_COMPANION"
+        "WEATHER", "LIGHTING", "SURFACE_CONDITION",
+        "WEATHER_CONDITIONS", "LIGHTING_CONDITIONS", "SURFACE_CONDITIONS",
+        "ZONE_TYPE", "VISUAL_SEGREGATION", "RIDING_COMPANION"
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -330,19 +331,31 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         if end < start:
             continue
 
+        vru_label = CODE_LABELS["VRU_TYPE"].get(str(int(row["VRU_TYPE"])), "Unknown")
+        interaction_label = CODE_LABELS["INTERACTION_TYPE"].get(str(int(row["INTERACTION_TYPE"])), "Unknown")
+
         rec = {
-            "VRU_TYPE_LABEL": CODE_LABELS["VRU_TYPE"].get(str(int(row["VRU_TYPE"])), "Unknown"),
-            "INTERACTION_LABEL": CODE_LABELS["INTERACTION_TYPE"].get(str(int(row["INTERACTION_TYPE"])), "Unknown"),
+            "VRU_TYPE_LABEL": vru_label,
+            "INTERACTION_LABEL": interaction_label,
         }
 
+        # Variables déjà présentes dans ton code
         for col, mapping_key in optional_maps.items():
             if col in df.columns and pd.notna(row.get(col)):
                 rec[f"{col}_LABEL"] = CODE_LABELS[mapping_key].get(str(int(row[col])), "Unknown")
             else:
                 rec[f"{col}_LABEL"] = np.nan
 
+ 
+        # Nouvelle variable : start_crossing
+        start_crossing_flag = int(vru_label == "Pedestrian" and interaction_label == "Crossing")
+
         for frame in range(start, end + 1):
-            records.append({"frame": frame, **rec})
+            records.append({
+                "frame": frame,
+                "start_crossing": 1 if (frame == start and start_crossing_flag == 1) else 0,
+                **rec
+            })
 
     if not records:
         return pd.DataFrame(columns=["frame"])
@@ -352,8 +365,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
     # Total VRU annotés par frame
     total_per_frame = expanded.groupby("frame").size().rename("n_vru_total")
 
-
-# 👉 Nombre de piétons par frame
+    # Nombre de piétons par frame
     ped_per_frame = (
         expanded[expanded["VRU_TYPE_LABEL"] == "Pedestrian"]
         .groupby("frame")
@@ -367,12 +379,6 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         .size()
         .rename("n_cyclists")
     )
-    ped_per_frame = (
-        expanded[expanded["VRU_TYPE_LABEL"] == "Pedestrian"]
-        .groupby("frame")
-        .size()
-        .rename("n_pedestrians")
-    )
 
     escooter_per_frame = (
         expanded[expanded["VRU_TYPE_LABEL"] == "E-scooter"]
@@ -380,6 +386,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         .size()
         .rename("n_escooters")
     )
+
     # Proportions VRU_TYPE
     vru_counts = expanded.groupby(["frame", "VRU_TYPE_LABEL"]).size().unstack(fill_value=0)
     vru_props = vru_counts.div(vru_counts.sum(axis=1), axis=0)
@@ -390,8 +397,23 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
     inter_props = inter_counts.div(inter_counts.sum(axis=1), axis=0)
     inter_props = inter_props.rename(columns=lambda c: f"prop_interaction_{normalize_label(c)}")
 
+    # start_crossing par frame
+    start_crossing_per_frame = (
+        expanded.groupby("frame")["start_crossing"]
+        .max()
+        .rename("start_crossing")
+    )
+
     out = pd.concat(
-        [total_per_frame, ped_per_frame, cyc_per_frame, escooter_per_frame, vru_props, inter_props],
+        [
+            total_per_frame,
+            ped_per_frame,
+            cyc_per_frame,
+            escooter_per_frame,
+            vru_props,
+            inter_props,
+            start_crossing_per_frame,
+        ],
         axis=1
     ).reset_index()
 
@@ -399,6 +421,10 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         if col not in out.columns:
             out[col] = 0
         out[col] = out[col].fillna(0).astype(int)
+
+    if "start_crossing" not in out.columns:
+        out["start_crossing"] = 0
+    out["start_crossing"] = out["start_crossing"].fillna(0).astype(int)
 
     expected_vru_cols = [
         "prop_vru_pedestrian",
@@ -424,9 +450,18 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
 
     # Variables contextuelles par frame : première valeur disponible
     context_cols = [
-        "VRU_AGE_GROUP_LABEL", "VRU_GAIT_LABEL", "VRU_GROUP_SIZE_LABEL",
-        "WEATHER_LABEL", "LIGHTING_LABEL", "SURFACE_CONDITION_LABEL",
-        "ZONE_TYPE_LABEL", "VISUAL_SEGREGATION_LABEL", "RIDING_COMPANION_LABEL"
+        "VRU_AGE_GROUP_LABEL",
+        "VRU_GAIT_LABEL",
+        "VRU_GROUP_SIZE_LABEL",
+        "WEATHER_LABEL",
+        "LIGHTING_LABEL",
+        "SURFACE_CONDITION_LABEL",
+        "WEATHER_CONDITIONS_LABEL",
+        "LIGHTING_CONDITIONS_LABEL",
+        "SURFACE_CONDITIONS_LABEL",
+        "ZONE_TYPE_LABEL",
+        "VISUAL_SEGREGATION_LABEL",
+        "RIDING_COMPANION_LABEL"
     ]
     for col in context_cols:
         if col in expanded.columns:
@@ -436,7 +471,6 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
             out = out.merge(ctx.rename(col), on="frame", how="left")
 
     return out
-
 
 def compute_encounter_summary_from_codebook(df_codebook: pd.DataFrame) -> dict:
     """
@@ -642,10 +676,14 @@ print(f"  dont trajets uniques     : {len(encounter_files)}\n")
 all_gps = []
 source_meta = {}          # prefix → infos de source
 encounter_summary_map = {}  # prefix → résumé events
-
+seen_prefixes = set()
 
 for enc_path in sorted(encounter_files):
     prefix = extract_prefix(enc_path)
+    if prefix in seen_prefixes:
+        print(f"⚠ Prefix déjà traité, ignoré : {prefix}")
+        continue
+    seen_prefixes.add(prefix)
 
     imu_candidates = (
         glob.glob(os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset*.csv'))
@@ -779,9 +817,13 @@ def frame_in_obstacle(frame, intervals):
 
 
 all_rows = []
-
+seen_prefixes = set()
 for enc_path in sorted(encounter_files):
     prefix = extract_prefix(enc_path)
+    if prefix in seen_prefixes:
+        print(f"⚠ Prefix déjà traité, ignoré : {prefix}")
+        continue
+    seen_prefixes.add(prefix)
 
     imu_candidates = (
         glob.glob(os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset*.csv'))
@@ -856,35 +898,37 @@ for enc_path in sorted(encounter_files):
         frame_df.insert(0, "source", prefix)
 
         keep = [
-            "source", "frame",
-            "speed_kmh", "gyrz_deg_s",
-            "n_vru_total",
-            "n_pedestrians",
-            "n_cyclists",
-            "n_escooters",
-            "prop_vru_pedestrian",
-            "prop_vru_cyclist",
-            "prop_vru_e_scooter",
-            "prop_vru_other_mmv",
-            "prop_vru_motor",
-            "prop_vru_animal",
-            "prop_vru_stationary",
-            "prop_vru_unknown",
-            "prop_interaction_same_direction",
-            "prop_interaction_opposite_direction",
-            "prop_interaction_crossing",
-            "prop_interaction_stationary",
-            "prop_interaction_unknown",
-            "VRU_AGE_GROUP_LABEL",
-            "VRU_GAIT_LABEL",
-            "VRU_GROUP_SIZE_LABEL",
-            "WEATHER_LABEL",
-            "LIGHTING_LABEL",
-            "SURFACE_CONDITION_LABEL",
-            "ZONE_TYPE_LABEL",
-            "VISUAL_SEGREGATION_LABEL",
-            "RIDING_COMPANION_LABEL",
-        ]
+    "source", "frame",
+    "speed_kmh", "gyrz_deg_s",
+    "n_vru_total",
+    "n_pedestrians",
+    "n_cyclists",
+    "n_escooters",
+    "prop_vru_pedestrian",
+    "prop_vru_cyclist",
+    "prop_vru_e_scooter",
+    "prop_vru_other_mmv",
+    "prop_vru_motor",
+    "prop_vru_animal",
+    "prop_vru_stationary",
+    "prop_vru_unknown",
+    "prop_interaction_same_direction",
+    "prop_interaction_opposite_direction",
+    "prop_interaction_crossing",
+    "prop_interaction_stationary",
+    "prop_interaction_unknown",
+    "start_crossing",
+    "VRU_AGE_GROUP_LABEL",
+    "VRU_GAIT_LABEL",
+    "VRU_GROUP_SIZE_LABEL",
+    "WEATHER_LABEL",
+    "LIGHTING_LABEL",
+    "SURFACE_CONDITION_LABEL",
+    "ZONE_TYPE_LABEL",
+    "VISUAL_SEGREGATION_LABEL",
+    "RIDING_COMPANION_LABEL",
+]
+        
         frame_df = frame_df[[c for c in keep if c in frame_df.columns]].copy()
 
         all_rows.append(frame_df)
