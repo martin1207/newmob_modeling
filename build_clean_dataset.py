@@ -60,10 +60,6 @@ CODE_LABELS = {
     "WEATHER":           {"1": "No adverse", "2": "Adverse", "9": "Unknown"},
     "LIGHTING":          {"1": "Daylight",   "2": "Dawn/Dusk", "9": "Unknown"},
     "SURFACE_CONDITION": {"1": "Dry", "2": "Wet", "3": "Gravel", "4": "Uneven", "9": "Unknown"},
-    "ZONE_TYPE":         {"1": "Pedestrian street", "2": "Park/greenway",
-                          "3": "Shared road",       "9": "Unknown"},
-    "VISUAL_SEGREGATION":{"1": "No", "2": "Yes (marked)", "9": "Unknown"},
-    "RIDING_COMPANION":  {"1": "Solo", "2": "With companion", "9": "Unknown"},
 }
 
 
@@ -137,11 +133,12 @@ TIME_SLOTS = [
     ("Evening",   18, 24),  # 18:00 – 23:59
 ]
 
-CODEBOOK_DIR     = '/Volumes/My Passport/NEWMOB/codebookescooter/'
-IMU_DIR          = '/Volumes/My Passport/NEWMOB/escooter/'
-ROAD_GPKG        = '/Volumes/My Passport/NEWMOB/road.gpkg'
-PARTICIPANTS_XLS = '/Volumes/My Passport/NEWMOB/participants_NewMob_Electromob_VAE_TE.xlsx'
-OUTPUT_FILE      = '/Volumes/My Passport/NEWMOB/clean_dataset.csv'
+CODEBOOK_DIR         = '/Volumes/My Passport/NEWMOB/codebookescooter/'
+IMU_DIR              = '/Volumes/My Passport/NEWMOB/escooter/'
+ROAD_GPKG            = '/Volumes/My Passport/NEWMOB/road.gpkg'
+PARTICIPANTS_XLS     = '/Volumes/My Passport/NEWMOB/participants_NewMob_Electromob_VAE_TE.xlsx'
+OUTPUT_FILE          = '/Volumes/My Passport/NEWMOB/clean_dataset.csv'
+INTERSECTIONS_CSV    = '/Volumes/My Passport/NEWMOB/clips_intersections/recap_intersections.csv'
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -250,6 +247,47 @@ def build_temporal_features(ts) -> dict:
 # HELPERS — Codebook annoté
 # ═════════════════════════════════════════════════════════════════════════════
 
+SESSION_CONTEXT_COLS = [
+    "WEATHER", "LIGHTING", "SURFACE_CONDITION",
+    "ZONE_TYPE", "VISUAL_SEGREGATION", "RIDING_COMPANION",
+]
+
+def load_session_context(prefix: str, codebook_dir: str) -> dict:
+    """Charge les attributs de session (météo, éclairage, surface…) depuis le
+    fichier encounters normal (pas debug). Retourne un dict col -> label string.
+
+    Itère sur tous les raters disponibles pour le prefix et prend la première
+    valeur non-vide pour chaque colonne (certains raters laissent ces champs vides).
+    """
+    candidates = sorted([
+        p for p in glob.glob(os.path.join(codebook_dir, f'{prefix}*_encounters*.csv'))
+        if 'debug_encounters' not in os.path.basename(p).lower()
+        and 'obstacle_zones'  not in os.path.basename(p).lower()
+        and not os.path.basename(p).startswith('.')
+    ])
+    if not candidates:
+        return {}
+
+    # Accumuler les valeurs non-vides par colonne sur tous les raters
+    ctx = {}
+    for path in candidates:
+        try:
+            df = pd.read_csv(path)
+            df.columns = df.columns.str.strip()
+        except Exception:
+            continue
+        for col in SESSION_CONTEXT_COLS:
+            if col in ctx:          # déjà trouvé pour cette colonne
+                continue
+            if col not in df.columns:
+                continue
+            series = pd.to_numeric(df[col], errors='coerce').dropna()
+            if len(series) > 0:
+                val = series.iloc[0]
+                ctx[f"{col}_LABEL"] = CODE_LABELS.get(col, {}).get(str(int(val)), "Unknown")
+    return ctx
+
+
 def load_codebook_annotated(prefix: str, codebook_dir: str):
     """
     Charge le fichier debug_encounters annoté pour un préfixe donné.
@@ -298,9 +336,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
     numeric_cols = [
         "FRAME_START", "FRAME_END", "VRU_TYPE", "INTERACTION_TYPE",
         "VRU_AGE_GROUP", "VRU_GAIT", "VRU_GROUP_SIZE",
-        "WEATHER", "LIGHTING", "SURFACE_CONDITION",
-        "WEATHER_CONDITIONS", "LIGHTING_CONDITIONS", "SURFACE_CONDITIONS",
-        "ZONE_TYPE", "VISUAL_SEGREGATION", "RIDING_COMPANION"
+        "WEATHER", "LIGHTING", "SURFACE_CONDITION"
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -312,16 +348,13 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
 
     records = []
 
+    # WEATHER/LIGHTING/SURFACE_CONDITION/ZONE_TYPE/VISUAL_SEGREGATION/RIDING_COMPANION
+    # ne sont PAS dans les debug_encounters — ils sont injectés après depuis le
+    # fichier encounters normal via load_session_context().
     optional_maps = {
-        "VRU_AGE_GROUP": "VRU_AGE_GROUP",
-        "VRU_GAIT": "VRU_GAIT",
+        "VRU_AGE_GROUP":  "VRU_AGE_GROUP",
+        "VRU_GAIT":       "VRU_GAIT",
         "VRU_GROUP_SIZE": "VRU_GROUP_SIZE",
-        "WEATHER": "WEATHER",
-        "LIGHTING": "LIGHTING",
-        "SURFACE_CONDITION": "SURFACE_CONDITION",
-        "ZONE_TYPE": "ZONE_TYPE",
-        "VISUAL_SEGREGATION": "VISUAL_SEGREGATION",
-        "RIDING_COMPANION": "RIDING_COMPANION",
     }
 
     for _, row in df.iterrows():
@@ -334,19 +367,43 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         vru_label = CODE_LABELS["VRU_TYPE"].get(str(int(row["VRU_TYPE"])), "Unknown")
         interaction_label = CODE_LABELS["INTERACTION_TYPE"].get(str(int(row["INTERACTION_TYPE"])), "Unknown")
 
+        age_label = CODE_LABELS["VRU_AGE_GROUP"].get(
+            str(int(row["VRU_AGE_GROUP"])) if "VRU_AGE_GROUP" in df.columns and pd.notna(row.get("VRU_AGE_GROUP")) else "9",
+            "Unknown"
+        )
+        gait_label = CODE_LABELS["VRU_GAIT"].get(
+            str(int(row["VRU_GAIT"])) if "VRU_GAIT" in df.columns and pd.notna(row.get("VRU_GAIT")) else "9",
+            "Unknown"
+        )
+        group_size_label = CODE_LABELS["VRU_GROUP_SIZE"].get(
+            str(int(row["VRU_GROUP_SIZE"])) if "VRU_GROUP_SIZE" in df.columns and pd.notna(row.get("VRU_GROUP_SIZE")) else "9",
+            "Unknown"
+        )
+
         rec = {
-            "VRU_TYPE_LABEL": vru_label,
-            "INTERACTION_LABEL": interaction_label,
+            "VRU_TYPE_LABEL":        vru_label,
+            "INTERACTION_LABEL":     interaction_label,
+            "VRU_AGE_GROUP_LABEL":   age_label,
+            "VRU_GAIT_LABEL":        gait_label,
+            "VRU_GROUP_SIZE_LABEL":  group_size_label,
+            # flags binaires pour comptage
+            "_is_pedestrian":        int(vru_label == "Pedestrian"),
+            "_is_elderly":           int(age_label == "Elderly"),
+            "_is_child":             int(age_label == "Child"),
+            "_is_running":           int(gait_label == "Running"),
+            "_is_group":             int(group_size_label == "Group (3+)"),
+            "_is_crossing":          int(interaction_label == "Crossing"),
+            "_is_ped_crossing":      int(vru_label == "Pedestrian" and interaction_label == "Crossing"),
+            "_is_ped_opposite":      int(vru_label == "Pedestrian" and interaction_label == "Opposite-direction"),
+            "_is_cyclist_crossing":  int(vru_label == "Cyclist" and interaction_label == "Crossing"),
         }
 
-        # Variables déjà présentes dans ton code
         for col, mapping_key in optional_maps.items():
             if col in df.columns and pd.notna(row.get(col)):
                 rec[f"{col}_LABEL"] = CODE_LABELS[mapping_key].get(str(int(row[col])), "Unknown")
             else:
                 rec[f"{col}_LABEL"] = np.nan
 
- 
         # Nouvelle variable : start_crossing
         start_crossing_flag = int(vru_label == "Pedestrian" and interaction_label == "Crossing")
 
@@ -404,6 +461,24 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         .rename("start_crossing")
     )
 
+    # ── Nouvelles variables de comptage par frame ─────────────────────────────
+    flag_cols = {
+        "_is_elderly":          "n_elderly",
+        "_is_child":            "n_children",
+        "_is_running":          "n_running",
+        "_is_group":            "n_groups",
+        "_is_crossing":         "n_crossing",
+        "_is_ped_crossing":     "n_pedestrians_crossing",
+        "_is_ped_opposite":     "n_pedestrians_opposite",
+        "_is_cyclist_crossing": "n_cyclists_crossing",
+    }
+    count_frames = {}
+    for flag, name in flag_cols.items():
+        if flag in expanded.columns:
+            count_frames[name] = (
+                expanded.groupby("frame")[flag].sum().rename(name)
+            )
+
     out = pd.concat(
         [
             total_per_frame,
@@ -413,6 +488,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
             vru_props,
             inter_props,
             start_crossing_per_frame,
+            *count_frames.values(),
         ],
         axis=1
     ).reset_index()
@@ -455,13 +531,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         "VRU_GROUP_SIZE_LABEL",
         "WEATHER_LABEL",
         "LIGHTING_LABEL",
-        "SURFACE_CONDITION_LABEL",
-        "WEATHER_CONDITIONS_LABEL",
-        "LIGHTING_CONDITIONS_LABEL",
-        "SURFACE_CONDITIONS_LABEL",
-        "ZONE_TYPE_LABEL",
-        "VISUAL_SEGREGATION_LABEL",
-        "RIDING_COMPANION_LABEL"
+        "SURFACE_CONDITION_LABEL"
     ]
     for col in context_cols:
         if col in expanded.columns:
@@ -520,6 +590,37 @@ def compute_encounter_summary_from_codebook(df_codebook: pd.DataFrame) -> dict:
 
     if "VRU_AGE_GROUP" in df.columns:
         pct_from_code("VRU_AGE_GROUP", CODE_LABELS["VRU_AGE_GROUP"], "pct_age")
+
+    if "VRU_GROUP_SIZE" in df.columns:
+        pct_from_code("VRU_GROUP_SIZE", CODE_LABELS["VRU_GROUP_SIZE"], "pct_group_size")
+
+    if "WEATHER" in df.columns:
+        pct_from_code("WEATHER", CODE_LABELS["WEATHER"], "pct_weather")
+
+    if "LIGHTING" in df.columns:
+        pct_from_code("LIGHTING", CODE_LABELS["LIGHTING"], "pct_lighting")
+
+    if "SURFACE_CONDITION" in df.columns:
+        pct_from_code("SURFACE_CONDITION", CODE_LABELS["SURFACE_CONDITION"], "pct_surface")
+
+    if "ZONE_TYPE" in df.columns:
+        pct_from_code("ZONE_TYPE", CODE_LABELS["ZONE_TYPE"], "pct_zone")
+
+    if "RIDING_COMPANION" in df.columns:
+        pct_from_code("RIDING_COMPANION", CODE_LABELS["RIDING_COMPANION"], "pct_companion")
+
+    # Métriques kinematics moyennes par trajet
+    for col, out_key in [
+        ("PEAK_DECEL_MS2",        "mean_peak_decel_ms2"),
+        ("TTC_MIN_S",             "mean_ttc_min_s"),
+        ("DRAC_MAX_MS2",          "mean_drac_max_ms2"),
+        ("REACTION_TIME_S",       "mean_reaction_time_s"),
+        ("DURATION_S",            "mean_encounter_duration_s"),
+        ("N_SIMULTANEOUS_VRUS",   "mean_simultaneous_vrus"),
+    ]:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors="coerce")
+            out[out_key] = round(vals.mean(), 3) if vals.notna().any() else np.nan
 
     # Assurer la présence des colonnes attendues
     expected = [
@@ -816,6 +917,26 @@ def frame_in_obstacle(frame, intervals):
     return any(s <= frame <= e for s, e in intervals)
 
 
+# ── Intersections ─────────────────────────────────────────────────────────────
+def load_intersection_intervals_for_prefix(prefix: str, intersections_csv: str) -> list:
+    """Retourne la liste des intervalles [frame_start, frame_end] pour les passages
+    en intersection du trajet `prefix`, depuis recap_intersections.csv.
+
+    Le fichier identifie les trajets via la colonne `video` (ex: '335t_2023-…_.mp4').
+    Le prefix correspond au nom de la vidéo sans extension.
+    """
+    try:
+        df = pd.read_csv(intersections_csv)
+        df.columns = df.columns.str.strip()
+        # Normaliser : retirer .mp4 et espaces
+        df['_prefix'] = df['video'].str.replace(r'\.mp4$', '', regex=True).str.strip()
+        mask = df['_prefix'] == prefix
+        sub = df.loc[mask, ['frame_start', 'frame_end']].apply(pd.to_numeric, errors='coerce').dropna()
+        return list(zip(sub['frame_start'].astype(int), sub['frame_end'].astype(int)))
+    except Exception:
+        return []
+
+
 all_rows = []
 seen_prefixes = set()
 for enc_path in sorted(encounter_files):
@@ -835,15 +956,18 @@ for enc_path in sorted(encounter_files):
 
     imu_path = imu_candidates[0]
 
-    obs_candidates = glob.glob(os.path.join(CODEBOOK_DIR, f'{prefix}*obstacle_zones*.csv'))
-    df_obstacles   = pd.read_csv(obs_candidates[0]) if obs_candidates else None
-    obs_intervals  = load_obstacle_intervals(df_obstacles)
+    obs_candidates     = glob.glob(os.path.join(CODEBOOK_DIR, f'{prefix}*obstacle_zones*.csv'))
+    df_obstacles       = pd.read_csv(obs_candidates[0]) if obs_candidates else None
+    obs_intervals      = load_obstacle_intervals(df_obstacles)
+    inter_intervals    = load_intersection_intervals_for_prefix(prefix, INTERSECTIONS_CSV)
 
     print(f"\n▶  {prefix}")
-    print(f"   IMU       : {os.path.basename(imu_path)}")
-    print(f"   Obstacles : {os.path.basename(obs_candidates[0]) if obs_candidates else 'aucun'}")
+    print(f"   IMU           : {os.path.basename(imu_path)}")
+    print(f"   Obstacles     : {os.path.basename(obs_candidates[0]) if obs_candidates else 'aucun'}")
+    print(f"   Intersections : {len(inter_intervals)} intervalle(s)")
 
-    df_codebook = load_codebook_annotated(prefix, CODEBOOK_DIR)
+    df_codebook    = load_codebook_annotated(prefix, CODEBOOK_DIR)
+    session_ctx    = load_session_context(prefix, CODEBOOK_DIR)
 
     try:
         imu = pd.read_csv(imu_path)
@@ -865,6 +989,18 @@ for enc_path in sorted(encounter_files):
         )
 
         frame_df = build_frame_level_from_debug_encounters(df_codebook)
+
+        # Injecter les attributs de session depuis le fichier encounters normal
+        for col_label, value in session_ctx.items():
+            frame_df[col_label] = value
+
+        # Flag at_intersection : 1 si la frame est dans un intervalle d'intersection
+        if inter_intervals:
+            frame_df['at_intersection'] = frame_df['frame'].apply(
+                lambda f: int(any(s <= f <= e for s, e in inter_intervals))
+            )
+        else:
+            frame_df['at_intersection'] = 0
 
         n0 = len(frame_df)
         if frame_df.empty:
@@ -918,15 +1054,24 @@ for enc_path in sorted(encounter_files):
     "prop_interaction_stationary",
     "prop_interaction_unknown",
     "start_crossing",
+    # Comptages annotés par frame
+    "n_elderly",
+    "n_children",
+    "n_running",
+    "n_groups",
+    "n_crossing",
+    "n_pedestrians_crossing",
+    "n_pedestrians_opposite",
+    "n_cyclists_crossing",
+    # Labels contextuels
     "VRU_AGE_GROUP_LABEL",
     "VRU_GAIT_LABEL",
     "VRU_GROUP_SIZE_LABEL",
     "WEATHER_LABEL",
     "LIGHTING_LABEL",
     "SURFACE_CONDITION_LABEL",
-    "ZONE_TYPE_LABEL",
-    "VISUAL_SEGREGATION_LABEL",
-    "RIDING_COMPANION_LABEL",
+    # Intersection
+    "at_intersection",
 ]
         
         frame_df = frame_df[[c for c in keep if c in frame_df.columns]].copy()
