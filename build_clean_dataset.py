@@ -272,7 +272,10 @@ def load_session_context(prefix: str, codebook_dir: str) -> dict:
     ctx = {}
     for path in candidates:
         try:
-            df = pd.read_csv(path)
+            with open(path) as _f:
+                _first = _f.readline()
+            sep = ';' if _first.count(';') > _first.count(',') else ','
+            df = pd.read_csv(path, sep=sep)
             df.columns = df.columns.str.strip()
         except Exception:
             continue
@@ -297,7 +300,10 @@ def load_codebook_annotated(prefix: str, codebook_dir: str):
     if not candidates:
         return None
     try:
-        df = pd.read_csv(candidates[0])
+        with open(candidates[0]) as _f:
+            _first = _f.readline()
+        sep = ';' if _first.count(';') > _first.count(',') else ','
+        df = pd.read_csv(candidates[0], sep=sep)
         df.columns = df.columns.str.strip()
 
         if "CONFIRM" in df.columns:
@@ -393,9 +399,11 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
             "_is_running":           int(gait_label == "Running"),
             "_is_group":             int(group_size_label == "Group (3+)"),
             "_is_crossing":          int(interaction_label == "Crossing"),
-            "_is_ped_crossing":      int(vru_label == "Pedestrian" and interaction_label == "Crossing"),
-            "_is_ped_opposite":      int(vru_label == "Pedestrian" and interaction_label == "Opposite-direction"),
-            "_is_cyclist_crossing":  int(vru_label == "Cyclist" and interaction_label == "Crossing"),
+            "_is_ped_crossing":          int(vru_label == "Pedestrian" and interaction_label == "Crossing"),
+            "_is_ped_opposite":          int(vru_label == "Pedestrian" and interaction_label == "Opposite-direction"),
+            "_is_ped_same_direction":    int(vru_label == "Pedestrian" and interaction_label == "Same-direction"),
+            "_is_ped_stationary":        int(vru_label == "Pedestrian" and interaction_label == "Stationary"),
+            "_is_cyclist_crossing":      int(vru_label == "Cyclist" and interaction_label == "Crossing"),
         }
 
         for col, mapping_key in optional_maps.items():
@@ -468,9 +476,11 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
         "_is_running":          "n_running",
         "_is_group":            "n_groups",
         "_is_crossing":         "n_crossing",
-        "_is_ped_crossing":     "n_pedestrians_crossing",
-        "_is_ped_opposite":     "n_pedestrians_opposite",
-        "_is_cyclist_crossing": "n_cyclists_crossing",
+        "_is_ped_crossing":         "n_pedestrians_crossing",
+        "_is_ped_opposite":         "n_pedestrians_opposite",
+        "_is_ped_same_direction":   "n_pedestrians_same_direction",
+        "_is_ped_stationary":       "n_pedestrians_stationary",
+        "_is_cyclist_crossing":     "n_cyclists_crossing",
     }
     count_frames = {}
     for flag, name in flag_cols.items():
@@ -720,19 +730,23 @@ print(f"  {len(road_m)} polygones — CRS : {road_m.crs}\n")
 
 
 def find_polygon_for_point(point, road_gdf, sindex):
+    """Retourne (geometry, env_type) du polygone le plus proche du point."""
     candidate_idx = list(sindex.intersection(point.bounds))
     candidates = road_gdf.iloc[candidate_idx]
 
     containing = candidates[candidates.contains(point)]
     if len(containing) > 0:
-        return containing.iloc[0].geometry
+        row = containing.iloc[0]
+        return row.geometry, row.get("type", np.nan)
 
     if len(candidates) > 0:
         distances = candidates.geometry.distance(point)
-        return candidates.loc[distances.idxmin(), "geometry"]
+        row = candidates.loc[distances.idxmin()]
+        return row.geometry, row.get("type", np.nan)
 
     distances = road_gdf.geometry.distance(point)
-    return road_gdf.loc[distances.idxmin(), "geometry"]
+    row = road_gdf.loc[distances.idxmin()]
+    return row.geometry, row.get("type", np.nan)
 
 
 def polygon_width_at_point(point, polygon, dx, dy, half_length=PERP_HALF_LENGTH):
@@ -860,9 +874,11 @@ for src, group in gdf.groupby("source"):
     widths = []
     print(f"  Calcul largeur : {src[-40:]}  ({len(group)} points)")
 
+    env_types = []
     for i in range(len(group)):
-        point   = group.geometry.iloc[i]
-        polygon = find_polygon_for_point(point, road_m, sindex)
+        point              = group.geometry.iloc[i]
+        polygon, env_type  = find_polygon_for_point(point, road_m, sindex)
+        env_types.append(env_type)
 
         i_prev = max(0, i - DIRECTION_WINDOW)
         i_next = min(len(group) - 1, i + DIRECTION_WINDOW)
@@ -880,17 +896,19 @@ for src, group in gdf.groupby("source"):
     group["road_width_perp_m"] = group["road_width_perp_m"].interpolate(
         method="linear", limit_direction="both"
     )
+    group["environment_type"] = env_types
 
-    for _, row in group[["frame", "road_width_perp_m"]].iterrows():
+    for _, row in group[["frame", "road_width_perp_m", "environment_type"]].iterrows():
         road_width_records.append({
             "source":            src,
             "frame_imu_raw":     row["frame"],
             "road_width_perp_m": row["road_width_perp_m"],
+            "environment_type":  row["environment_type"],
         })
 
 road_width_df = pd.DataFrame(road_width_records)
 road_width_df["frame"] = road_width_df["frame_imu_raw"] - GPS_OFFSET_FRAMES
-road_width_df = road_width_df[["source", "frame", "road_width_perp_m"]]
+road_width_df = road_width_df[["source", "frame", "road_width_perp_m", "environment_type"]]
 
 print(f"\n  ✔  road_width_df : {len(road_width_df)} lignes\n")
 
@@ -978,7 +996,16 @@ for enc_path in sorted(encounter_files):
             print(f"   ⚠  Colonnes IMU manquantes : {missing_imu} — ignoré")
             continue
 
-        imu = imu.copy()
+        imu = imu.sort_values("frame").copy()
+
+        # Interpolation linéaire de VitGPS(km/h) entre valeurs voisines valides
+        # (même source garantie — pas d'extrapolation aux bords)
+        n_nan_speed = imu["VitGPS(km/h)"].isna().sum()
+        imu["VitGPS(km/h)"] = imu["VitGPS(km/h)"].interpolate(method="linear")
+        n_interpolated = n_nan_speed - imu["VitGPS(km/h)"].isna().sum()
+        if n_nan_speed > 0:
+            print(f"   VitGPS NaN : {n_nan_speed} → {n_interpolated} interpolées")
+
         imu["frame_corrected"] = imu["frame"] - GPS_OFFSET_FRAMES
 
         valid_frames = set(
@@ -1062,6 +1089,8 @@ for enc_path in sorted(encounter_files):
     "n_crossing",
     "n_pedestrians_crossing",
     "n_pedestrians_opposite",
+    "n_pedestrians_same_direction",
+    "n_pedestrians_stationary",
     "n_cyclists_crossing",
     # Labels contextuels
     "VRU_AGE_GROUP_LABEL",
@@ -1072,6 +1101,8 @@ for enc_path in sorted(encounter_files):
     "SURFACE_CONDITION_LABEL",
     # Intersection
     "at_intersection",
+    # Environnement
+    "environment_type",
 ]
         
         frame_df = frame_df[[c for c in keep if c in frame_df.columns]].copy()
@@ -1100,7 +1131,19 @@ else:
 
     n_missing_rw = dataset["road_width_perp_m"].isna().sum()
     if n_missing_rw > 0:
-        print(f"  ⚠  {n_missing_rw} lignes sans largeur de route")
+        print(f"  ⚠  {n_missing_rw} lignes sans largeur de route — remplissage par valeur la plus proche (ffill/bfill)")
+        dataset = dataset.sort_values(["source", "frame"])
+        dataset["road_width_perp_m"] = (
+            dataset.groupby("source")["road_width_perp_m"]
+            .transform(lambda s: s.ffill().bfill())
+        )
+        dataset["environment_type"] = (
+            dataset.groupby("source")["environment_type"]
+            .transform(lambda s: s.ffill().bfill())
+        )
+        n_still_missing = dataset["road_width_perp_m"].isna().sum()
+        if n_still_missing > 0:
+            print(f"  ⚠  {n_still_missing} lignes encore NaN (source entièrement sans GPS)")
 
     print("\n" + "=" * 65)
     print("ÉTAPE D — Jointure riders + variables temporelles")

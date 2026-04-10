@@ -14,19 +14,32 @@ from IPython.display import display
 
 
 BETA_LABELS = {
-    'ASC':                          r'ASC',
-    'beta_z_n_pedestrians_acc':        r'\beta_{\text{Number of pedestrians}}',
-    'beta_z_road_width_perp_m_acc':    r'\beta_{\text{Road width (m)}}',
-    'beta_genre_female_acc':           r'\beta_{\text{Female (ref: Male)}}',
-    'beta_z_hour_acc':                 r'\beta_{\text{Hour}}',
-    'beta_z_age_acc':                  r'\beta_{\text{Age}}',
-    "beta_experience_0_5_acc":         r'\beta_{\text{Experience < 6 months (ref: > 2 years)}}',
-    "beta_experience_0_5_1_acc":       r'\beta_{\text{Experience 6 months--1 year (ref: > 2 years)}}',
-    "beta_experience_1_2":         r'\beta_{\text{Experience 1--2 years (ref: > 2 years)}}',
-    'beta_z_distance_km':          r'\beta_{\text{Total distance (km)}}',
-    "SIGMA_ACC":                   r'\sigma_{\text{acc}}',
-    "SIGMA_DEC":                   r'\sigma_{\text{dec}}'
+    'ASC_ACC':                          r'ASC_{ACC}',
+    'beta_z_n_pedestrians_acc':        r'\beta_{\text{Number of pedestrians,ACC}}',
+    'beta_z_road_width_perp_m_acc':    r'\beta_{\text{Road width (m),ACC}}',
+    'beta_genre_female_acc':           r'\beta_{\text{Female (ref: Male),ACC}}',
+    'beta_z_hour_acc':                 r'\beta_{\text{Hour,ACC}}',
+    'beta_z_age_acc':                  r'\beta_{\text{Age,ACC}}',
+    "beta_experience_0_5_acc":         r'\beta_{\text{Exp < 6 m(ref: > 2 y,ACC}}',
+    "beta_experience_0_5_1_acc":       r'\beta_{\text{Exp 6 m-1 y (ref: > 2 y),ACC}}',
+    "beta_experience_1_2":         r'\beta_{\text{Exp 1--2 y (ref: > 2 y),ACC}}',
+    'beta_z_distance_km':          r'\beta_{\text{Total distance (km),ACC}}',
+    'beta_z_n_pedestrians_crossing_acc':        r'\beta_{\text{Number of pedestrians crossing,ACC}}',
+    'ASC_DEC':                          r'ASC_{DEC}',
+    "SIGMA_ACC":                   r'\sigma_{\text{ACC}',
+    "SIGMA_DEC":                   r'\sigma_{\text{DEC}}',
+    'beta_z_n_pedestrians_dec':        r'\beta_{\text{Number of pedestrians,DEC}}',
+    'beta_z_road_width_perp_m_dec':    r'\beta_{\text{Road width (m),DEC}}',
+    'beta_genre_female_dec':           r'\beta_{\text{Female (ref: Male),DEC}}',
+    'beta_z_hour_dec':                 r'\beta_{\text{Hour,DEC}}',
+    'beta_z_age_dec':                  r'\beta_{\text{Age,DEC}}',
+    "beta_experience_0_5_dec":         r'\beta_{\text{Exp < 6 m(ref: > 2 y),DEC}}',
+    "beta_experience_0_5_1_dec":       r'\beta_{\text{Exp 6 m-1 y (ref: > 2 y),DEC}}',
+    "beta_experience_1_2_dec":         r'\beta_{\text{Exp 1--2 y (ref: > 2 y),DEC}}',
+    'beta_z_distance_km_dec':          r'\beta_{\text{Total distance (km),DEC}}',
+    'beta_z_n_pedestrians_crossing_dec':        r'\beta_{\text{Number of pedestrians crossing,DEC}}'
 }
+
 
 def _df_to_latex_params(df, model_name):
     """Génère un tableau LaTeX des paramètres estimés."""
@@ -46,7 +59,7 @@ def _df_to_latex_params(df, model_name):
         r'\begin{table}[h!]\centering\small',
         r'\begin{tabular}{lrrrr}',
         r'\hline\hline',
-        r'Paramètre & Valeur & Std. err. rob. & $t$-stat. rob. & $p$-valeur \\',
+        r'Parameter & Value & Std. err. rob. & $t$-stat. rob. & $p$-value \\',
         r'\hline',
     ]
 
@@ -81,7 +94,7 @@ def _df_to_latex_params(df, model_name):
     lines += [
         r'\hline\hline',
         r'\end{tabular}',
-        rf'\caption{{Estimated parameters of the linear regression model predicting the speed}}',
+        rf'\caption{{Estimated parameters of the mixed logit model predicting the speed}}',
         rf'\label{{tab:{model_name}_params}}',
         r'\end{table}',
     ]
@@ -109,18 +122,16 @@ def _metrics_to_latex(metrics, metrics_const, lrt_stat, lrt_df, lrt_p, model_nam
         )
         lrt_p_txt = f'{lrt_p:.4f}'
 
+    k_structural = metrics.get('K_structural', metrics['K'])
+
     rows = [
         (r'$N$',                            f'{metrics["N"]}'),
-        (r'$K$',                            f'{metrics["K"]}'),
-        (r'$\mathcal{LL}(\mathrm{null})$',  f'{metrics["LL_null"]:.2f}'),
-        (r'$\mathcal{LL}(\mathrm{cst})$',   f'{metrics["LL_const"]:.2f}'),
-        (r'$\mathcal{LL}(\hat{\beta})$',    f'{metrics["LL_final"]:.2f}'),
-        (r'$\rho^2_{\mathrm{null}}$',       f'{metrics["rho2_null"]:.4f}'),
+        (r'$K$',                            f'{k_structural}'),
+        (r'$\mathcal{LL}(\mathrm{cst})$',   f'{round(metrics["LL_const"])}'),
+        (r'$\mathcal{LL}(\hat{\beta})$',    f'{round(metrics["LL_final"])}'),
         (r'$\bar{\rho}^2_{\mathrm{null}}$', f'{metrics["rho2bar_null"]:.4f}'),
         (r'$\rho^2_{\mathrm{cst}}$',        f'{metrics["rho2_const"]:.4f}'),
         (r'$\bar{\rho}^2_{\mathrm{cst}}$',  f'{metrics["rho2bar_const"]:.4f}'),
-        (r'AIC',                            f'{metrics["AIC"]:.2f}'),
-        (r'BIC',                            f'{metrics["BIC"]:.2f}'),
         (rf'LRT $\chi^2({lrt_df})$ vs cst', f'{lrt_stat:.2f}{sig}'),
         (r'$p$-valeur LRT',                 lrt_p_txt),
     ]
@@ -129,7 +140,7 @@ def _metrics_to_latex(metrics, metrics_const, lrt_stat, lrt_df, lrt_p, model_nam
         r'\begin{table}[h!]\centering\small',
         r'\begin{tabular}{lr}',
         r'\hline\hline',
-        r'Statistique & Valeur \\',
+        r'Statistics & Value \\',
         r'\hline',
     ] + [rf'{label} & {val} \\' for label, val in rows] + [
         r'\hline\hline',
@@ -142,7 +153,78 @@ def _metrics_to_latex(metrics, metrics_const, lrt_stat, lrt_df, lrt_p, model_nam
     return '\n'.join(lines)
 
 
-print('✔ Fonctions LaTeX chargées : _df_to_latex_params, _metrics_to_latex')
+def _metrics_to_latex_mxl(metrics, lrt_stat, lrt_df, lrt_p, model_name):
+    """Tableau LaTeX des statistiques pour un Mixed Logit panel.
+    Inclut N_obs, N_riders, number_of_draws et LL du modèle constant."""
+
+    if lrt_p is None or (isinstance(lrt_p, float) and np.isnan(lrt_p)):
+        sig, lrt_p_txt = '', 'n/a'
+    else:
+        sig = (
+            r'$^{***}$' if lrt_p < .001 else
+            r'$^{**}$'  if lrt_p < .01  else
+            r'$^{*}$'   if lrt_p < .05  else ''
+        )
+        lrt_p_txt = f'{lrt_p:.4f}'
+
+    ll_const      = metrics.get('LL_const', np.nan)
+    rho2_const    = metrics.get('rho2_const', np.nan)
+    rho2bar_const = metrics.get('rho2bar_const', np.nan)
+    k_structural  = metrics.get('K_structural', metrics['K'])
+
+    lrt_mnl_stat = metrics.get('LRT_mnl_stat', np.nan)
+    lrt_mnl_df   = metrics.get('LRT_mnl_df',   np.nan)
+    lrt_mnl_p    = metrics.get('LRT_mnl_p',    np.nan)
+    if not np.isnan(lrt_mnl_p):
+        sig_mnl = (
+            r'$^{***}$' if lrt_mnl_p < .001 else
+            r'$^{**}$'  if lrt_mnl_p < .01  else
+            r'$^{*}$'   if lrt_mnl_p < .05  else ''
+        )
+        lrt_mnl_txt = f'{lrt_mnl_stat:.2f}{sig_mnl}'
+        lrt_mnl_p_txt = f'{lrt_mnl_p:.4f}'
+        lrt_mnl_df_txt = int(lrt_mnl_df)
+    else:
+        lrt_mnl_txt, lrt_mnl_p_txt, lrt_mnl_df_txt = 'n/a', 'n/a', '?'
+
+    rows = [
+        (r'$N_{\text{obs}}$',
+         f'{metrics["N_obs"]:,}'),
+        (r'$N_{\text{riders}}$',
+         f'{metrics["N_individuals"]:,}'),
+        (r'$K$',
+         f'{k_structural}'),
+        (r'Number of draws',
+         f'{metrics.get("number_of_draws","n/a")} ({metrics.get("draw_type","")})'),
+        (r'$\mathcal{LL}(\mathrm{cst})$',
+         f'{round(ll_const)}' if not np.isnan(ll_const) else 'n/a'),
+        (r'$\mathcal{LL}(\hat{\beta})$',
+         f'{round(metrics["LL_final"])}'),
+        (r'$\bar{\rho}^2_{\mathrm{cst}}$',
+         f'{rho2bar_const:.4f}' if not np.isnan(rho2bar_const) else 'n/a'),
+        (r'$p$-valeur LRT vs cst', lrt_p_txt),
+        (rf'LRT $\chi^2({lrt_mnl_df_txt})$ vs MNL ($\sigma\!=\!0$)',
+         lrt_mnl_txt),
+        (r'$p$-valeur LRT vs MNL', lrt_mnl_p_txt),
+    ]
+
+    lines = [
+        r'\begin{table}[h!]\centering\small',
+        r'\begin{tabular}{lr}',
+        r'\hline\hline',
+        r'Statistics & Value \\',
+        r'\hline',
+    ] + [rf'{label} & {val} \\' for label, val in rows] + [
+        r'\hline\hline',
+        r'\end{tabular}',
+        rf'\caption{{Statistics of the mixed logit panel model predicting the speed change}}',
+        rf'\label{{tab:{model_name}_stats}}',
+        r'\end{table}',
+    ]
+    return '\n'.join(lines)
+
+
+print('✔ Fonctions LaTeX chargées : _df_to_latex_params, _metrics_to_latex, _metrics_to_latex_mxl')
 
 def _get_out_dir(model_name):
     base = os.path.join('model_results', model_name)
@@ -152,6 +234,57 @@ def _get_out_dir(model_name):
     while os.path.exists(f'{base}_v{i}'):
         i += 1
     return f'{base}_v{i}'
+
+
+def _has_draws(expr):
+    """Retourne True si l'expression contient des bioDraws / Draws."""
+    name = type(expr).__name__
+    if name in ('bioDraws', 'Draws', 'MonteCarlo', 'PanelLikelihoodTrajectory'):
+        return True
+    # Fallback : vérifier la représentation string
+    try:
+        if 'Draw' in str(expr) or 'NORMAL' in str(expr) or 'UNIFORM' in str(expr):
+            return True
+    except Exception:
+        pass
+    return any(_has_draws(c) for c in getattr(expr, 'children', []))
+
+
+def _strip_draws(expr):
+    """Retire récursivement les termes contenant bioDraws d'une utilité.
+
+    Pour chaque nœud additif (Plus/Minus), on stripe récursivement les deux
+    branches et on les recombine, ce qui préserve les termes déterministes
+    même lorsqu'ils co-existent avec des draws dans le même sous-arbre.
+    Pour les nœuds multiplicatifs contenant des draws → Numeric(0).
+    """
+    if not _has_draws(expr):
+        return expr
+
+    children = getattr(expr, 'children', [])
+
+    # Nœud feuille avec draws (ex. bioDraws lui-même)
+    if not children:
+        return ex.Numeric(0)
+
+    node_name = type(expr).__name__.lower()
+
+    if len(children) == 2:
+        left, right = children
+
+        # Addition : stripper les deux branches et recombiner
+        if any(k in node_name for k in ('plus', 'add')):
+            return _strip_draws(left) + _strip_draws(right)
+
+        # Soustraction : idem
+        if any(k in node_name for k in ('minus', 'sub')):
+            return _strip_draws(left) - _strip_draws(right)
+
+        # Multiplication / division contenant des draws → 0
+        return ex.Numeric(0)
+
+    # Nœud unaire ou n-aire avec draws → 0
+    return ex.Numeric(0)
 
 
 def _extract_vars(expr):
@@ -337,9 +470,11 @@ def run_mnl_3levels(
     lrt_df = k - k_const
     lrt_p = sp_stats.chi2.sf(lrt_stat, lrt_df) if lrt_df > 0 else np.nan
 
-    metrics['LRT_stat'] = round(lrt_stat, 2)
-    metrics['LRT_df'] = lrt_df
-    metrics['LRT_p'] = round(lrt_p, 4) if not np.isnan(lrt_p) else np.nan
+    metrics['LRT_stat']     = round(lrt_stat, 2)
+    metrics['LRT_df']       = lrt_df
+    metrics['LRT_p']        = round(lrt_p, 4) if not np.isnan(lrt_p) else np.nan
+    # K structural = tous les paramètres (MNL n'a pas de sigma)
+    metrics['K_structural'] = k
 
     # ── 6. params_df ───────────────────────────────────────────────────────
     params_df = res.get_estimated_parameters()
@@ -523,8 +658,52 @@ def run_mxl_panel_3levels(
 
     print(f"[{model_name}] Database panel créée avec succès")
 
-    # ── 3. Modèle mixed logit panel ────────────────────────────────────────
-    print(f"[{model_name}] Étape 3/6 - Construction du modèle mixed logit panel")
+    # ── 3a. Modèle constant (MNL, ASC seulement) ──────────────────────────────
+    print(f"[{model_name}] Étape 3a/6 - Estimation du modèle constant (MNL)")
+
+    const_name = f'{model_name}_constant'
+    _ASC_DEC = ex.Beta('ASC_DEC', 0, None, None, 0)
+    _ASC_ACC = ex.Beta('ASC_ACC', 0, None, None, 0)
+    _V_const = {0: _ASC_DEC, 1: ex.Numeric(0), 2: _ASC_ACC}
+    _av_const = {0: 1, 1: 1, 2: 1}
+    _logprob_const = models.loglogit(_V_const, _av_const, choice)
+    _params_const = Parameters()
+    _params_const.set_value('generate_html', False)
+    _params_const.set_value('generate_yaml', False)
+    _params_const.set_value('generate_netcdf', False)
+    _db_const = db.Database(const_name, data)
+    _m_const = bio.BIOGEME(_db_const, _logprob_const, parameters=_params_const)
+    _m_const.model_name = const_name
+    _res_const = _m_const.estimate()
+    ll_const = _res_const.raw_estimation_results.final_log_likelihood
+    k_const  = len(_res_const.get_beta_values())
+    print(f"[{model_name}] Modèle constant : LL={ll_const:.2f}  K={k_const}")
+
+    # ── 3b. MNL avec les mêmes utilités (sigma=0, sans effets aléatoires) ─────
+    print(f"[{model_name}] Étape 3b/6 - Estimation MNL (sigma=0, mêmes utilités)")
+    ll_mnl, k_mnl = np.nan, 0
+
+    mnl_name = f'{model_name}_mnl'
+    _u_dec_mnl = _strip_draws(utility_decelerate)
+    _u_acc_mnl = _strip_draws(utility_accelerate)
+    print(f"[{model_name}] Utilités MNL (draws retirés) — dec: {_u_dec_mnl}  acc: {_u_acc_mnl}")
+
+    _V_mnl = {0: _u_dec_mnl, 1: ex.Numeric(0), 2: _u_acc_mnl}
+    _logprob_mnl = models.loglogit(_V_mnl, av, choice)
+    _params_mnl = Parameters()
+    _params_mnl.set_value('generate_html', False)
+    _params_mnl.set_value('generate_yaml', False)
+    _params_mnl.set_value('generate_netcdf', False)
+    _db_mnl = db.Database(mnl_name, data)
+    _m_mnl = bio.BIOGEME(_db_mnl, _logprob_mnl, parameters=_params_mnl)
+    _m_mnl.model_name = mnl_name
+    _res_mnl = _m_mnl.estimate()
+    ll_mnl = _res_mnl.raw_estimation_results.final_log_likelihood
+    k_mnl  = len(_res_mnl.get_beta_values())
+    print(f"[{model_name}] MNL (sigma=0) : LL={ll_mnl:.2f}  K={k_mnl}")
+
+    # ── 3c. Modèle mixed logit panel ──────────────────────────────────────────
+    print(f"[{model_name}] Étape 3c/6 - Construction du modèle mixed logit panel")
 
     V = {
         0: utility_decelerate,
@@ -592,21 +771,54 @@ def run_mxl_panel_3levels(
     metrics = _compute_metrics(
         ll_f=final_ll,
         ll_null=ll_null,
-        ll_const=np.nan,
-        n=N_ind,
+        ll_const=ll_const,
+        n=N_obs,
         nk=k,
         name=model_name,
     )
 
-    metrics['N_obs'] = N_obs
-    metrics['N_individuals'] = N_ind
-    metrics['draw_type'] = draw_type
+    # K structural = paramètres hors SIGMA
+    sigma_prefix = ('SIGMA_', 'sigma_')
+    k_structural = sum(
+        1 for name in res.get_beta_values()
+        if not any(name.startswith(p) for p in sigma_prefix)
+    )
+    n_sigmas = k - k_structural
+
+    lrt_stat_const = -2 * (ll_const - final_ll)
+    lrt_df_const   = k - k_const
+    lrt_p_const    = sp_stats.chi2.sf(lrt_stat_const, lrt_df_const) if lrt_df_const > 0 else np.nan
+
+    # LRT vs MNL (sigma=0) : df = nombre de sigmas
+    if np.isnan(ll_mnl):
+        lrt_stat_mnl, lrt_df_mnl, lrt_p_mnl = np.nan, n_sigmas, np.nan
+    else:
+        lrt_stat_mnl = -2 * (ll_mnl - final_ll)
+        lrt_df_mnl   = n_sigmas
+        lrt_p_mnl    = sp_stats.chi2.sf(lrt_stat_mnl, lrt_df_mnl) if lrt_df_mnl > 0 else np.nan
+
+    metrics['N_obs']           = N_obs
+    metrics['N_individuals']   = N_ind
+    metrics['draw_type']       = draw_type
     metrics['number_of_draws'] = number_of_draws
+    metrics['LL_const']        = round(ll_const, 2)
+    metrics['K_structural']    = k_structural
+    metrics['LRT_stat']        = round(lrt_stat_const, 2)
+    metrics['LRT_df']          = lrt_df_const
+    metrics['LRT_p']           = round(lrt_p_const, 4) if not np.isnan(lrt_p_const) else np.nan
+    metrics['LRT_mnl_stat']    = round(lrt_stat_mnl, 2)
+    metrics['LRT_mnl_df']      = lrt_df_mnl
+    metrics['LRT_mnl_p']       = round(lrt_p_mnl, 4) if not np.isnan(lrt_p_mnl) else np.nan
 
     print(f"[{model_name}] Métriques calculées")
-    print(f"[{model_name}]   - Final LL : {final_ll:.6f}")
-    print(f"[{model_name}]   - LL null  : {ll_null if np.isnan(ll_null) else round(ll_null, 6)}")
-    print(f"[{model_name}]   - K        : {k}")
+    print(f"[{model_name}]   - Final LL      : {final_ll:.2f}")
+    print(f"[{model_name}]   - LL const      : {ll_const:.2f}")
+    print(f"[{model_name}]   - LL MNL        : {ll_mnl:.2f}")
+    print(f"[{model_name}]   - K total       : {k}  (structural={k_structural}, sigmas={n_sigmas})")
+    if not np.isnan(lrt_p_const):
+        print(f"[{model_name}]   - LRT vs cst    : χ²({lrt_df_const})={lrt_stat_const:.2f}  p={lrt_p_const:.4f}")
+    if not np.isnan(lrt_p_mnl):
+        print(f"[{model_name}]   - LRT vs MNL    : χ²({lrt_df_mnl})={lrt_stat_mnl:.2f}  p={lrt_p_mnl:.4f}")
 
     # ── 5. Paramètres estimés ──────────────────────────────────────────────
     print(f"[{model_name}] Étape 5/6 - Extraction des paramètres estimés")
@@ -630,16 +842,15 @@ def run_mxl_panel_3levels(
             f.write(_df_to_latex_params(params_df, model_name))
         print(f"[{model_name}] Fichier paramètres LaTeX sauvegardé : {tex_params_path}")
 
-    if '_metrics_to_latex' in globals():
+    if '_metrics_to_latex_mxl' in globals():
         tex_stats_path = os.path.join(out_dir, f'{model_name}_stats.tex')
         with open(tex_stats_path, 'w') as f:
             f.write(
-                _metrics_to_latex(
+                _metrics_to_latex_mxl(
                     metrics,
-                    None,
-                    np.nan,
-                    np.nan,
-                    np.nan,
+                    metrics.get('LRT_stat', np.nan),
+                    metrics.get('LRT_df',   np.nan),
+                    metrics.get('LRT_p',    np.nan),
                     model_name
                 )
             )
