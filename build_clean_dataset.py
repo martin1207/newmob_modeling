@@ -299,6 +299,8 @@ def load_codebook_annotated(prefix: str, codebook_dir: str):
     candidates = glob.glob(os.path.join(codebook_dir, f'{prefix}*_encounters_debug_encounters*.csv'))
     if not candidates:
         return None
+    # Préférer rater2 sur rater1 si les deux sont disponibles
+    candidates = sorted(candidates, key=lambda p: (0 if re.search(r'rater2', p, re.IGNORECASE) else 1))
     try:
         with open(candidates[0]) as _f:
             _first = _f.readline()
@@ -396,11 +398,12 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
             "_is_pedestrian":        int(vru_label == "Pedestrian"),
             "_is_elderly":           int(age_label == "Elderly"),
             "_is_child":             int(age_label == "Child"),
-            "_is_running":           int(gait_label == "Running"),
+            "_is_standing":          int(gait_label == "Standing" or interaction_label == "Stationary"),
+            "_is_running":           int(gait_label == "Running" and interaction_label != "Stationary"),
             "_is_group":             int(group_size_label == "Group (3+)"),
             "_is_crossing":          int(interaction_label == "Crossing"),
             "_is_ped_crossing":          int(vru_label == "Pedestrian" and interaction_label == "Crossing"),
-            "_is_ped_opposite":          int(vru_label == "Pedestrian" and interaction_label == "Opposite-direction"),
+            "_is_ped_opposite":          int(vru_label == "Pedestrian" and interaction_label == "Opposite-direction" and interaction_label != "Stationary"),
             "_is_ped_same_direction":    int(vru_label == "Pedestrian" and interaction_label == "Same-direction"),
             "_is_ped_stationary":        int(vru_label == "Pedestrian" and interaction_label == "Stationary"),
             "_is_cyclist_crossing":      int(vru_label == "Cyclist" and interaction_label == "Crossing"),
@@ -473,6 +476,7 @@ def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.Dat
     flag_cols = {
         "_is_elderly":          "n_elderly",
         "_is_child":            "n_children",
+        "_is_standing":         "n_standing",
         "_is_running":          "n_running",
         "_is_group":            "n_groups",
         "_is_crossing":         "n_crossing",
@@ -1034,19 +1038,28 @@ for enc_path in sorted(encounter_files):
             print("   ℹ  Aucune frame issue de debug_encounters")
             continue
 
+        # speed_kmh_t1 : vitesse IMU à la frame suivante, même source uniquement.
+        # Calculé avant filtrage pour conserver la valeur même si t+1 est filtré.
+        speed_map = imu.drop_duplicates("frame_corrected").set_index("frame_corrected")["VitGPS(km/h)"].to_dict()
+        frame_df["speed_kmh_t1"] = frame_df["frame"].add(1).map(speed_map)
+
         frame_df = frame_df[frame_df["frame"].isin(valid_frames)].copy()
         print(f"   Virages   : {n0 - len(frame_df):>4} lignes retirées → {len(frame_df)} restantes")
 
         n1 = len(frame_df)
         if obs_intervals:
-            frame_raw = frame_df["frame"] + GPS_OFFSET_FRAMES
-            mask_obs  = ~frame_raw.apply(lambda f: frame_in_obstacle(f, obs_intervals))
+            mask_obs  = ~frame_df["frame"].apply(lambda f: frame_in_obstacle(f, obs_intervals))
             frame_df  = frame_df.loc[mask_obs].copy()
         print(f"   Obstacles : {n1 - len(frame_df):>4} lignes retirées → {len(frame_df)} restantes")
 
         if frame_df.empty:
             print("   ℹ  Plus aucune frame après filtrage")
             continue
+
+        # Forcer NaN sur la dernière frame restante par source (pas de t+1 garanti
+        # dans la même source après concaténation).
+        last_frame = frame_df["frame"].max()
+        frame_df.loc[frame_df["frame"] == last_frame, "speed_kmh_t1"] = np.nan
 
         # Jointure IMU (vitesse, gyro)
         imu_sub = (
@@ -1062,7 +1075,7 @@ for enc_path in sorted(encounter_files):
 
         keep = [
     "source", "frame",
-    "speed_kmh", "gyrz_deg_s",
+    "speed_kmh", "speed_kmh_t1", "gyrz_deg_s",
     "n_vru_total",
     "n_pedestrians",
     "n_cyclists",
@@ -1084,6 +1097,7 @@ for enc_path in sorted(encounter_files):
     # Comptages annotés par frame
     "n_elderly",
     "n_children",
+    "n_standing",
     "n_running",
     "n_groups",
     "n_crossing",

@@ -7,8 +7,12 @@
 suppressPackageStartupMessages({
   library(lme4)
   library(lmerTest)   # ajoute les p-valeurs aux lmer (approx. Satterthwaite)
-  if (!requireNamespace("MuMIn", quietly = TRUE)) install.packages("MuMIn", repos = "https://cloud.r-project.org")
+  if (!requireNamespace("MuMIn",     quietly = TRUE)) install.packages("MuMIn",     repos = "https://cloud.r-project.org")
+  if (!requireNamespace("showtext",  quietly = TRUE)) install.packages("showtext",  repos = "https://cloud.r-project.org")
+  if (!requireNamespace("sysfonts",  quietly = TRUE)) install.packages("sysfonts",  repos = "https://cloud.r-project.org")
+  if (!requireNamespace("ggeffects", quietly = TRUE)) install.packages("ggeffects", repos = "https://cloud.r-project.org")
   library(MuMIn)      # r.squaredGLMM : R² marginal et conditionnel
+  library(nlme)       # lme + corAR1 : modèle AR(1) sur les résidus
 })
 
 # ── Labels LaTeX ──────────────────────────────────────────────────────────────
@@ -16,10 +20,15 @@ suppressPackageStartupMessages({
 # Utilisée à la fois pour les β et pour les symboles de variables (x̃, 𝟙, x).
 ID_LABELS <- c(
   "z_n_pedestrians"            = "N visible pedestrians < 15m",
+  "z_n_cyclists"              = "N visible cyclists < 15m",
+  "z_n_vru_ped_cyc"           = "N visible pedestrians + cyclists < 15m",
+
   "z_road_width_perp_m"        = "Road width (m)",
+  "road_width_catmedium"       = "Medium road (6–12m, ref: wide)",
+  "road_width_catnarrow"       = "Narrow road (<6m, ref: wide)",
   "z_n_elderly"                = "N elderly",
   "z_n_children"               = "N children",
-  "z_n_running"                = "N running pedestrians",
+  "z_n_running"                = "N visible running pedestrians < 15m",
   "z_hour"                     = "Hour",
   "z_age"                      = "Age",
   "distance_km"                = "Distance (km)",
@@ -35,9 +44,23 @@ ID_LABELS <- c(
   "experience<0.5"             = "Exp. <6mo",
   "prop_vru_cyclist"            = "Prop. cyclist",
   "prop_vru_pedestrian"         = "Proportion of pedestrians <15m among VRUs",
-  "prop_interaction_same_direction" = "Proportion of same-direction encounters",
-  "prop_interaction_opposite_direction" = "Proportion of opposite-direction encounters",
-  "prop_interaction_crossing" = "Proportion of crossing encounters"
+  "z_prop_interaction_same_direction" = "Proportion of same-direction encounters",
+  "z_prop_interaction_opposite_direction" = "Proportion of opposite-direction encounters",
+  "z_prop_interaction_crossing"         = "Proportion of crossing encounters",
+  "is_afternoon"                        = "Afternoon (ref : Morning)",
+  "is_park"                             = "Park (ref : other)",
+  "is_square"                           = "Square (ref : other)"
+)
+
+# ── Ordre d'affichage préféré pour les graphes marginaux ─────────────────────
+PLOT_VAR_ORDER <- c(
+  "genremale", "genrefemale",
+  "z_prop_interaction_same_direction",
+  "z_n_cyclists",
+  "z_n_pedestrians",
+  "z_n_running",
+  "is_afternoon",
+  "at_intersection", "at_intersection1"
 )
 
 # Texte d'affichage pour un nom R — lookup dans ID_LABELS, sinon auto-génération.
@@ -71,6 +94,297 @@ ID_LABELS <- c(
   i <- 2
   while (dir.exists(paste0(base, "_v", i))) i <- i + 1
   paste0(base, "_v", i)
+}
+
+# ── Marginal means plot ───────────────────────────────────────────────────────
+# Produit un graphique par variable significative (p < alpha) :
+#   • Variables z_* (continues standardisées) : courbe prédite sur [-2, 2] SD,
+#     axe x re-transformé en unités originales (z * sd + mean)
+#   • Autres variables numériques             : courbe sur [min, max]
+#   • Variables binaires / facteurs           : points par modalité
+# Les autres prédicteurs sont fixés à leur moyenne (0 pour les z_vars).
+# Sauvegarde : <out_dir>/<model_name>_marginal_<varname>.pdf
+.plot_marginal_means <- function(fit, params_df, data, model_name,
+                                 out_dir, alpha = 0.05, is_mixed = FALSE,
+                                 raw_data = NULL) {
+  # raw_data : df_est complet (toutes colonnes), utilisé pour récupérer les
+  # colonnes originales (non standardisées) des z_* variables
+  if (is.null(raw_data)) raw_data <- data
+
+  if (!requireNamespace("ggplot2", quietly = TRUE))
+    stop("ggplot2 requis pour .plot_marginal_means")
+
+  # ── Police LaTeX (EB Garamond via showtext) ───────────────────────────────
+  use_latex_font <- FALSE
+  if (requireNamespace("showtext", quietly = TRUE) &&
+      requireNamespace("sysfonts", quietly = TRUE)) {
+    tryCatch({
+      sysfonts::font_add_google("EB Garamond", "ebgaramond")
+      showtext::showtext_auto()
+      use_latex_font <- TRUE
+    }, error = function(e) {
+      message("showtext: police EB Garamond non chargée — police système utilisée")
+    })
+  }
+  base_family <- if (use_latex_font) "ebgaramond" else "serif"
+
+  # ── Thème publication ────────────────────────────────────────────────────
+  theme_latex <- ggplot2::theme_bw(base_size = 16, base_family = base_family) +
+    ggplot2::theme(
+      plot.title       = ggplot2::element_text(size = 18, face = "bold",
+                                               margin = ggplot2::margin(b = 4)),
+      plot.subtitle    = ggplot2::element_text(size = 14, color = "grey30",
+                                               margin = ggplot2::margin(b = 8)),
+      axis.title       = ggplot2::element_text(size = 16),
+      axis.text        = ggplot2::element_text(size = 14, color = "grey20"),
+      panel.grid.major = ggplot2::element_line(color = "grey90", linewidth = 0.4),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.border     = ggplot2::element_rect(color = "grey60", linewidth = 0.6),
+      plot.margin      = ggplot2::margin(8, 12, 8, 8)
+    )
+
+  # p-value column name varies between lm and lmer outputs
+  pvcol <- intersect(c("Pr(>|t|)", "Pr(>|z|)"), colnames(params_df))[1]
+  if (is.na(pvcol)) return(invisible(NULL))
+
+  # Significant fixed effects (exclude intercept)
+  sig_rows <- rownames(params_df)[
+    !grepl("Intercept", rownames(params_df)) 
+  ]
+  if (length(sig_rows) == 0) {
+    message(sprintf("[%s] Aucune variable significative (alpha=%.2f) — pas de graphique.", model_name, alpha))
+    return(invisible(NULL))
+  }
+
+  # Fixed-effects vcov & design matrix helper
+  vc_fix <- if (is_mixed) as.matrix(vcov(fit)) else vcov(fit)
+
+  # Build baseline row: means of numeric cols, ref level for factors
+  num_cols  <- names(data)[sapply(data, is.numeric)]
+  fac_cols  <- names(data)[sapply(data, function(x) is.factor(x) || is.character(x))]
+  baseline  <- as.data.frame(lapply(names(data), function(nm) {
+    if (nm %in% num_cols) mean(data[[nm]], na.rm = TRUE)
+    else                  data[[nm]][1]          # first obs = reference
+  }), stringsAsFactors = FALSE)
+  names(baseline) <- names(data)
+
+  # Force z_* baseline to 0 (standardised → mean = 0)
+  z_cols <- grep("^z_", names(baseline), value = TRUE)
+  for (zc in z_cols) if (zc %in% names(baseline)) baseline[[zc]] <- 0
+
+  if (!requireNamespace("patchwork", quietly = TRUE)) {
+    message("Installation de patchwork...")
+    install.packages("patchwork", repos = "https://cloud.r-project.org")
+  }
+
+  plot_list <- list()   # collecte tous les ggplots
+
+  for (var in sig_rows) {
+
+    # Identify the raw column name :
+    #   1. z_foo  → foo  (cherche dans raw_data pour avoir la colonne originale)
+    #   2. exact match in data
+    #   3. factor dummy : "at_intersection1" → "at_intersection" (longest prefix match)
+    raw_col <- if (grepl("^z_", var) && sub("^z_", "", var) %in% names(raw_data))
+                 sub("^z_", "", var)
+               else if (var %in% names(data)) var
+               else {
+                 candidates <- names(data)[sapply(names(data), function(nm)
+                   startsWith(var, nm) && nchar(var) > nchar(nm))]
+                 if (length(candidates) > 0)
+                   candidates[which.max(nchar(candidates))]
+                 else NA_character_
+               }
+
+    ref_col_data  <- if (!is.na(raw_col) && raw_col %in% names(raw_data)) raw_data[[raw_col]]
+                     else if (!is.na(raw_col) && raw_col %in% names(data)) data[[raw_col]]
+                     else NULL
+    is_binary     <- !is.null(ref_col_data) &&
+                     all(ref_col_data %in% c(0, 1, NA), na.rm = TRUE)
+    is_factor_var <- !is.null(ref_col_data) &&
+                     (is.factor(ref_col_data) || is.character(ref_col_data))
+
+    # ── Build prediction grid ──────────────────────────────────────────────
+    x_display <- NULL   # sera défini dans le bloc continu si nécessaire
+    # colonne à utiliser dans le grid : toujours raw_col si disponible dans data
+    col_in_data <- if (!is.na(raw_col) && raw_col %in% names(data)) raw_col else var
+    if (is_binary || is_factor_var) {
+      levs <- if (is_factor_var) sort(unique(as.character(ref_col_data))) else c(0, 1)
+
+      # Récupérer les levels exacts depuis les données du modèle
+      col_levels <- if (col_in_data %in% names(data) && is.factor(data[[col_in_data]]))
+                      levels(data[[col_in_data]])
+                    else if (!is.null(ref_col_data))
+                      sort(unique(as.character(ref_col_data)))
+                    else levs
+
+      grid <- do.call(rbind, lapply(levs, function(lv) {
+        row <- baseline
+        row[[col_in_data]] <- factor(lv, levels = col_levels)
+        row
+      }))
+      x_var  <- col_in_data
+      x_lab  <- .id_text(var)
+      is_cat <- TRUE
+    } else {
+      n_pts <- 60
+
+      is_z_var <- grepl("^z_", var) && !is.na(raw_col) && raw_col %in% names(raw_data)
+
+      if (is_z_var) {
+        # Plage = range complet de la variable originale depuis raw_data
+        raw_mean  <- mean(raw_data[[raw_col]], na.rm = TRUE)
+        raw_sd    <- sd(raw_data[[raw_col]],   na.rm = TRUE)
+        rng_orig  <- range(raw_data[[raw_col]], na.rm = TRUE)
+        orig_vals <- seq(rng_orig[1], rng_orig[2], length.out = n_pts)
+        z_vals    <- (orig_vals - raw_mean) / raw_sd
+        x_display <- orig_vals
+        x_lab     <- .id_text(var)
+        grid <- do.call(rbind, lapply(z_vals, function(v) {
+          row <- baseline
+          row[[var]] <- v
+          row
+        }))
+      } else {
+        col_for_range <- if (!is.na(raw_col) && raw_col %in% names(data)) raw_col else
+                         if (var %in% names(data)) var else NA_character_
+        if (is.na(col_for_range) || !any(is.finite(data[[col_for_range]]))) {
+          message(sprintf("[%s] ⚠ '%s' : plage non finie — graphique ignoré.", model_name, var))
+          next
+        }
+        orig_vals <- seq(min(data[[col_for_range]], na.rm = TRUE),
+                         max(data[[col_for_range]], na.rm = TRUE),
+                         length.out = n_pts)
+        x_display <- orig_vals
+        x_lab     <- .id_text(var)
+        grid <- do.call(rbind, lapply(orig_vals, function(v) {
+          row <- baseline
+          row[[var]] <- v
+          row
+        }))
+      }
+      x_var  <- var
+      is_cat <- FALSE
+    }
+
+    # ── Prédiction + IC (méthode delta) + IP (ggeffects) ────────────────────────
+      tryCatch({
+        if (is_mixed) {
+          pred_vals <- predict(fit, newdata = grid, re.form = NA)
+        } else {
+          pred_vals <- predict(fit, newdata = grid)
+        }
+
+        # IC via méthode delta (effets fixes uniquement)
+        X       <- model.matrix(formula(fit, fixed.only = TRUE), data = grid)
+        vc_fix  <- as.matrix(vcov(fit))
+        common  <- intersect(colnames(X), colnames(vc_fix))
+        X_sub   <- X[, common, drop = FALSE]
+        vc_sub  <- vc_fix[common, common, drop = FALSE]
+        var_ci  <- pmax(0, diag(X_sub %*% vc_sub %*% t(X_sub)))
+        ci_lo   <- pred_vals - 1.96 * sqrt(var_ci)
+        ci_hi   <- pred_vals + 1.96 * sqrt(var_ci)
+
+        # IP pour une nouvelle observation d'un nouveau groupe (rider + trip) :
+        #   se_PI = sqrt(var_IC_fixes + σ²_ε + σ²_rider + σ²_trip + ...)
+        # Tous les composants aléatoires sont extraits via lme4::VarCorr().
+        if (is_mixed) {
+          var_resid <- sigma(fit)^2
+          var_ranef <- sum(sapply(lme4::VarCorr(fit),
+                                  function(vc) {
+                                    v <- diag(as.matrix(vc))
+                                    sum(v[is.finite(v) & v > 0])
+                                  }))
+          se_pi <- sqrt(var_ci + var_resid + var_ranef)
+        } else {
+          pred_pi <- predict(fit, newdata = grid,
+                             interval = "prediction", level = 0.95)
+          se_pi   <- (pred_pi[, "upr"] - pred_vals) / 1.96
+        }
+        pi_lo  <- pred_vals - 1.96 * se_pi
+        pi_hi  <- pred_vals + 1.96 * se_pi
+        has_ci <- TRUE
+
+        # Valeurs axe x
+        x_plot <- if (!is_cat && !is.null(x_display)) x_display else grid[[x_var]]
+
+        plot_df <- data.frame(
+          x      = x_plot,
+          fit    = pred_vals,
+          ci_lwr = ci_lo,
+          ci_upr = ci_hi,
+          pi_lwr = pi_lo,
+          pi_upr = pi_hi
+        )
+
+      # ── Graphique ──────────────────────────────────────────────────────────
+      if (is_cat) {
+        g <- ggplot2::ggplot(plot_df, ggplot2::aes(x = factor(x), y = fit)) +
+          { if (has_ci)
+              ggplot2::geom_errorbar(ggplot2::aes(ymin = pi_lwr, ymax = pi_upr),
+                                     width = 0.25, color = "#6BA3C8", linewidth = 1.0, alpha = 0.5)
+          } +
+          { if (has_ci)
+              ggplot2::geom_errorbar(ggplot2::aes(ymin = ci_lwr, ymax = ci_upr),
+                                     width = 0.12, color = "#1A3A5C", linewidth = 0.7, alpha = 0.9)
+          } +
+          ggplot2::geom_point(size = 3.5, color = "#1A3A5C") +
+          ggplot2::labs(title = NULL, subtitle = NULL,
+                        x = x_lab, y = "Speed (km/h)",
+                        caption = NULL) +
+          ggplot2::coord_cartesian(ylim = c(0, 30)) +
+          theme_latex
+      } else {
+        g <- ggplot2::ggplot(plot_df, ggplot2::aes(x = x, y = fit)) +
+          { if (has_ci)
+              ggplot2::geom_ribbon(ggplot2::aes(ymin = pi_lwr, ymax = pi_upr),
+                                   fill = "#6BA3C8", alpha = 0.12)
+          } +
+          { if (has_ci)
+              ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_lwr, ymax = ci_upr),
+                                   fill = "#1A3A5C", alpha = 0.25)
+          } +
+          ggplot2::geom_line(color = "#1A3A5C", linewidth = 1.1) +
+          ggplot2::scale_x_continuous(n.breaks = 6) +
+          ggplot2::scale_y_continuous(n.breaks = 6) +
+          ggplot2::labs(title = NULL, subtitle = NULL,
+                        x = x_lab, y = "Speed (km/h)",
+                        caption = NULL) +
+          ggplot2::coord_cartesian(ylim = c(0, 30)) +
+          theme_latex
+      }
+
+      plot_list[[var]] <- g
+
+    }, error = function(e) {
+      message(sprintf("[%s] ⚠ Impossible de tracer '%s' : %s", model_name, var, conditionMessage(e)))
+    })
+  }
+
+  if (length(plot_list) == 0) return(invisible(NULL))
+
+  # ── Tri selon PLOT_VAR_ORDER (variables non listées vont à la fin) ───────────
+  ordered_keys <- c(
+    intersect(PLOT_VAR_ORDER, names(plot_list)),          # dans l'ordre voulu
+    setdiff(names(plot_list), PLOT_VAR_ORDER)             # reste alphabétique
+  )
+  plot_list <- plot_list[ordered_keys]
+
+  # ── Assemblage en une seule figure ──────────────────────────────────────────
+  n_plots <- length(plot_list)
+  ncols   <- min(3L, n_plots)
+  nrows   <- ceiling(n_plots / ncols)
+
+  combined <- patchwork::wrap_plots(plot_list, ncol = ncols)
+
+  out_file <- file.path(out_dir, paste0(model_name, "_marginal_all.png"))
+  ggplot2::ggsave(out_file, combined,
+                  width  = ncols * 4.5,
+                  height = nrows * 3.5,
+                  device = "png", dpi = 300)
+  message(sprintf("[%s] ✔ marginal plots → %s", model_name, basename(out_file)))
+
+  invisible(NULL)
 }
 
 .sig_stars <- function(p) {
@@ -338,6 +652,9 @@ run_linear <- function(df_est, rhs, model_name, ref = NULL) {
   vars_used <- unique(c("speed_kmh_t1", all.vars(formula_obj)))
   vars_used <- vars_used[vars_used %in% names(df_est)]
   data      <- df_est[, vars_used, drop = FALSE]
+  for (cn in names(data)) {
+    if (is.character(data[[cn]])) data[[cn]] <- factor(data[[cn]])
+  }
   before    <- nrow(data)
   data      <- data[complete.cases(data), ]
   dropped   <- before - nrow(data)
@@ -386,6 +703,27 @@ run_linear <- function(df_est, rhs, model_name, ref = NULL) {
   cat(sprintf("%s\n", strrep("=", 65)))
   print(summary(fit)$coefficients)
 
+  # ── Corrélations entre betas estimés (cov2cor sur vcov des effets fixes) ──
+  cor_beta <- cov2cor(as.matrix(vcov(fit)))
+  cor_beta[lower.tri(cor_beta, diag = TRUE)] <- NA
+  idx_b <- which(!is.na(cor_beta), arr.ind = TRUE)
+  if (nrow(idx_b) > 0) {
+    cor_beta_pairs <- data.frame(
+      var1 = rownames(cor_beta)[idx_b[, 1]],
+      var2 = colnames(cor_beta)[idx_b[, 2]],
+      r    = cor_beta[idx_b],
+      stringsAsFactors = FALSE
+    )
+    cor_beta_pairs <- cor_beta_pairs[order(abs(cor_beta_pairs$r), decreasing = TRUE), ]
+    cat(sprintf("\n  [%s] Corrélations entre betas estimés (ordre décroissant |r|) :\n", model_name))
+    for (i in seq_len(nrow(cor_beta_pairs))) {
+      flag <- if (abs(cor_beta_pairs$r[i]) > 0.7) "  ⚠ > 0.7" else ""
+      cat(sprintf("    cor(%-30s, %-30s) = %+.3f%s\n",
+                  cor_beta_pairs$var1[i], cor_beta_pairs$var2[i], cor_beta_pairs$r[i], flag))
+    }
+    cat("\n")
+  }
+
   metrics <- list(
     Model    = model_name,
     N        = N,
@@ -413,26 +751,11 @@ run_linear <- function(df_est, rhs, model_name, ref = NULL) {
              file.path(out_dir, paste0(model_name, "_params.tex")))
   writeLines(.stats_to_latex(metrics, model_name),
              file.path(out_dir, paste0(model_name, "_stats.tex")))
+  .plot_marginal_means(fit, params_df, data, model_name, out_dir, is_mixed = FALSE, raw_data = df_est)
 
   invisible(list(fit = fit, params = params_df, metrics = metrics))
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# run_mixed_linear_panel(df_est, rhs, model_name, panel_id_col)
-#
-# Estime un modèle linéaire mixte gaussien en panel.
-#   y_it = rhs_it + u_i + e_it
-#   u_i  ~ N(0, sigma_rider²)   (intercept aléatoire par rider)
-#   e_it ~ N(0, sigma_eps²)
-#
-# Arguments
-#   df_est       : data.frame
-#   rhs          : partie fixe, ex. "z_n_pedestrians + genre_female"
-#   model_name   : identifiant du modèle
-#   panel_id_col : colonne identifiant l'individu (défaut : "rider_id")
-#
-# Retour : liste(fit, params, metrics)
-# ══════════════════════════════════════════════════════════════════════════════
 run_mixed_linear_panel <- function(df_est, rhs, model_name,
                                    panel_id_col = "rider_id",
                                    method = "ML") {
@@ -454,34 +777,14 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
                          all.vars(as.formula(paste("~", rhs)))))
   vars_used <- vars_used[vars_used %in% names(df_est)]
   data      <- df_est[, vars_used, drop = FALSE]
+  # Convertir les colonnes character en factor pour que lmer encode correctement
+  for (cn in names(data)) {
+    if (is.character(data[[cn]])) data[[cn]] <- factor(data[[cn]])
+  }
   before    <- nrow(data)
   data      <- data[complete.cases(data), ]
   dropped   <- before - nrow(data)
   if (dropped > 0) message(sprintf("[%s] ⚠ %d lignes supprimées (NaN)", model_name, dropped))
-
-  # ── Vérification multicolinéarité (|r| > 0.7) ────────────────────────────
-  pred_vars <- setdiff(all.vars(as.formula(paste("~", rhs))), names(data)[!names(data) %in% names(df_est)])
-  pred_vars <- intersect(pred_vars, names(data))
-  num_vars  <- pred_vars[sapply(data[pred_vars], is.numeric)]
-  if (length(num_vars) >= 2) {
-    cor_mat <- cor(data[num_vars], use = "complete.obs")
-    cor_mat[lower.tri(cor_mat, diag = TRUE)] <- NA
-    idx     <- which(!is.na(cor_mat), arr.ind = TRUE)
-    cor_pairs <- data.frame(
-      var1 = rownames(cor_mat)[idx[, 1]],
-      var2 = colnames(cor_mat)[idx[, 2]],
-      r    = cor_mat[idx],
-      stringsAsFactors = FALSE
-    )
-    cor_pairs <- cor_pairs[order(abs(cor_pairs$r)), ]
-    cat(sprintf("\n  [%s] Corrélations entre prédicteurs (ordre croissant |r|) :\n", model_name))
-    for (i in seq_len(nrow(cor_pairs))) {
-      flag <- if (abs(cor_pairs$r[i]) > 0.7) "  ⚠ > 0.7" else ""
-      cat(sprintf("    cor(%-30s, %-30s) = %+.3f%s\n",
-                  cor_pairs$var1[i], cor_pairs$var2[i], cor_pairs$r[i], flag))
-    }
-    cat("\n")
-  }
 
   # Trier par premier identifiant panel
   data <- data[order(data[[panel_cols[1]]]), ]
@@ -548,6 +851,27 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
               lrt_df, lrt_stat, lrt_p, sig_str))
   cat(sprintf("%s\n", strrep("=", 72)))
   print(summary(fit)$coefficients)
+
+  # ── Corrélations entre betas estimés (cov2cor sur vcov des effets fixes) ──
+  cor_beta <- cov2cor(as.matrix(vcov(fit)))
+  cor_beta[lower.tri(cor_beta, diag = TRUE)] <- NA
+  idx_b <- which(!is.na(cor_beta), arr.ind = TRUE)
+  if (nrow(idx_b) > 0) {
+    cor_beta_pairs <- data.frame(
+      var1 = rownames(cor_beta)[idx_b[, 1]],
+      var2 = colnames(cor_beta)[idx_b[, 2]],
+      r    = cor_beta[idx_b],
+      stringsAsFactors = FALSE
+    )
+    cor_beta_pairs <- cor_beta_pairs[order(abs(cor_beta_pairs$r), decreasing = TRUE), ]
+    cat(sprintf("\n  [%s] Corrélations entre betas estimés (ordre décroissant |r|) :\n", model_name))
+    for (i in seq_len(nrow(cor_beta_pairs))) {
+      flag <- if (abs(cor_beta_pairs$r[i]) > 0.7) "  ⚠ > 0.7" else ""
+      cat(sprintf("    cor(%-30s, %-30s) = %+.3f%s\n",
+                  cor_beta_pairs$var1[i], cor_beta_pairs$var2[i], cor_beta_pairs$r[i], flag))
+    }
+    cat("\n")
+  }
 
   # Effets aléatoires supplémentaires (panel cols 2+) + LRT via ranova
   extra_sigmas <- list()
@@ -634,6 +958,7 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
              file.path(out_dir, paste0(model_name, "_params.tex")))
   writeLines(.stats_to_latex(metrics, model_name),
              file.path(out_dir, paste0(model_name, "_stats.tex")))
+  .plot_marginal_means(fit, params_df, data, model_name, out_dir, is_mixed = TRUE, raw_data = df_est)
 
   invisible(list(fit = fit, params = params_df, metrics = metrics))
 }
