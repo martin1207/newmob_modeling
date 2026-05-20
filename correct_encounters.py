@@ -16,7 +16,7 @@ Inputs (par clip <CLIP>) :
   <CODEBOOK>/<CLIP>_rater{R}_encounters_obstacle_zones.csv
   <CODEBOOK>/<CLIP>_rater{R}_session.json   (optionnel, mis à jour si présent)
 
-Lecture seule :
+Lecture seule :Studdying
   <ESCOOTER_DIR>/<CLIP>_corrected_with_offset.csv  (pour vitesse GPS)
 
 Sortie :  modifs en place avec backup *.bak du fichier modifié.

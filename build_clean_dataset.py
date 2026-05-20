@@ -24,6 +24,10 @@ Variables frame-level ajoutées depuis debug_encounters :
   - proportions de INTERACTION_TYPE
   - labels contextuels (gait, age group, weather, etc.)
 
+Variables de direction ajoutées depuis l'IMU (cf. overlay_annotations.py) :
+  - steering_choice : 'straight' / 'left' / 'right' (Δyaw intégré sur 1 s)
+  - delta_yaw_deg   : Δyaw signé (deg) sur la fenêtre (gauche = positif)
+
 Variables temporelles ajoutées (par trajet) :
   timestamp_dt, date, hour, day_of_week, day_name, is_weekend,
   time_of_day, month, season
@@ -44,6 +48,60 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, LineString
+
+# ── Modèle de distance (réutilise overlay_annotations.py) ─────────────────────
+import sys as _sys
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in _sys.path:
+    _sys.path.insert(0, _THIS_DIR)
+try:
+    # predict_distances(bboxes) -> liste de distances (m) ou None.
+    # Charge le modèle joblib paresseusement (cf. overlay_annotations.py).
+    from overlay_annotations import predict_distances as _oa_predict_distances
+except Exception as _e:
+    print(f"⚠  overlay_annotations indisponible ({_e}) — distances non prédites")
+    _oa_predict_distances = None
+
+try:
+    # Choix de direction par fenêtre de 1 s (Δyaw = ∫GyrZ dt), mêmes
+    # constantes et même classification que l'overlay vidéo.
+    from overlay_annotations import (
+        compute_steering_choices_per_second as _oa_compute_steering,
+        count_steering_maneuvers          as _oa_count_steering,
+        STEERING_PIE_WINDOW_S,
+        STEERING_PIE_THRESHOLD_DEG,
+        GYRZ_LEFT_POSITIVE,
+    )
+except Exception as _e:
+    print(f"⚠  overlay_annotations.steering indisponible ({_e}) — steering non calculé")
+    _oa_compute_steering = None
+    _oa_count_steering   = None
+    STEERING_PIE_WINDOW_S      = 1.0
+    STEERING_PIE_THRESHOLD_DEG = 10.0
+    GYRZ_LEFT_POSITIVE         = True
+
+
+def _selftest_distance_model():
+    """Force un appel sur une bbox factice pour valider tôt que le modèle
+    est utilisable. Affiche un diagnostic clair sinon."""
+    if _oa_predict_distances is None:
+        print("⚠  Modèle de distance NON disponible (import overlay_annotations échoué).")
+        return False
+    try:
+        out = _oa_predict_distances([(100, 100, 200, 300)])
+    except Exception as e:
+        print(f"⚠  Self-test distance : exception levée : {e}")
+        return False
+    if not out or out[0] is None:
+        print("⚠  Self-test distance : prédiction = None (joblib/sklearn manquants ?")
+        print("    → installer joblib + sklearn dans le Python qui exécute ce script,")
+        print(f"    → ou vérifier le bundle dans overlay_annotations.DISTANCE_MODEL_PATH.")
+        return False
+    print(f"✔  Modèle de distance opérationnel (test : {out[0]:.2f} m sur bbox factice)")
+    return True
+
+
+_DIST_MODEL_OK = _selftest_distance_model()
 
 
 # ── Mapping codes ────────────────────────────────────────────────────────────
@@ -124,6 +182,10 @@ GPS_OFFSET_FRAMES    = 60
 TURN_THRESHOLD_DEG_S = 20
 PERP_HALF_LENGTH     = 100
 DIRECTION_WINDOW     = 5
+# Framerate vidéo utilisé pour intégrer le yaw sur la fenêtre de steering.
+# Pas de vidéo ouverte ici → on reprend le fallback de correct_encounters.py
+# (cap.get(CAP_PROP_FPS) or 30.0).
+VIDEO_FPS            = 30.0
 
 # Tranches horaires : (label, heure_debut_incluse, heure_fin_exclue)
 TIME_SLOTS = [
@@ -138,6 +200,7 @@ IMU_DIR              = '/Volumes/My Passport/NEWMOB/escooter/'
 ROAD_GPKG            = '/Volumes/My Passport/NEWMOB/road.gpkg'
 PARTICIPANTS_XLS     = '/Volumes/My Passport/NEWMOB/participants_NewMob_Electromob_VAE_TE.xlsx'
 OUTPUT_FILE          = '/Volumes/My Passport/NEWMOB/clean_dataset.csv'
+DETECTIONS_FILE      = '/Volumes/My Passport/NEWMOB/clean_dataset_vru_detections.csv'
 INTERSECTIONS_CSV    = '/Volumes/My Passport/NEWMOB/clips_intersections/recap_intersections.csv'
 
 
@@ -316,6 +379,334 @@ def load_codebook_annotated(prefix: str, codebook_dir: str):
     except Exception as e:
         print(f"   ⚠  Codebook non chargé : {e}")
         return None
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPERS — Détections VRU au niveau bbox (autodetect.csv) + distance
+#           Réplique la logique de overlay_annotations.py
+# ═════════════════════════════════════════════════════════════════════════════
+
+def find_enc_csv_path(prefix: str, codebook_dir: str):
+    """Chemin du debug_encounters préférentiel (rater2 > rater1)."""
+    candidates = glob.glob(
+        os.path.join(codebook_dir, f'{prefix}*_encounters_debug_encounters*.csv')
+    )
+    if not candidates:
+        return None
+    candidates = sorted(
+        candidates,
+        key=lambda p: (0 if re.search(r'rater2', p, re.IGNORECASE) else 1),
+    )
+    return candidates[0]
+
+
+def find_autodet_csv_path(prefix: str, codebook_dir: str):
+    """Chemin du fichier _debug_autodetect.csv (per-frame bbox)."""
+    candidates = glob.glob(
+        os.path.join(codebook_dir, f'{prefix}*_debug_autodetect.csv')
+    )
+    return candidates[0] if candidates else None
+
+
+def _normalize_tid(x):
+    """Track-id → string normalisé ('5' vs '5.0' vs 5 → '5'). None si NaN."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    try:
+        return str(int(float(x)))
+    except (ValueError, TypeError):
+        s = str(x).strip()
+        return s if s and s.lower() != 'nan' else None
+
+
+def load_enc_meta_full(enc_csv: str) -> dict:
+    """{(track_id_str, frame): meta} pour CONFIRM == 1.
+
+    Comme `overlay_annotations.load_enc_meta`, plus VRU_GROUP_SIZE et la
+    normalisation explicite des track_id en strings entiers.
+    Couvre PRIMARY_TRACK_ID + LINKED_TRACKS sur [FRAME_START, FRAME_END].
+    """
+    enc_meta = {}
+    if not enc_csv or not os.path.exists(enc_csv):
+        return enc_meta
+
+    with open(enc_csv) as f:
+        first = f.readline()
+    sep = ';' if first.count(';') > first.count(',') else ','
+
+    df = pd.read_csv(enc_csv, sep=sep)
+    df.columns = df.columns.str.strip()
+    if 'CONFIRM' not in df.columns:
+        return enc_meta
+    df = df[pd.to_numeric(df['CONFIRM'], errors='coerce') == 1]
+    if df.empty:
+        return enc_meta
+
+    def _label(field, raw):
+        if pd.isna(raw):
+            return ''
+        try:
+            code = str(int(float(raw)))
+        except (ValueError, TypeError):
+            return str(raw).strip()
+        return CODE_LABELS.get(field, {}).get(code, code)
+
+    for _, row in df.iterrows():
+        try:
+            f0 = int(row['FRAME_START'])
+            f1 = int(row['FRAME_END'])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if f1 < f0:
+            continue
+
+        meta = {
+            'vtype':      _label('VRU_TYPE',         row.get('VRU_TYPE')),
+            'itype':      _label('INTERACTION_TYPE', row.get('INTERACTION_TYPE')),
+            'age':        _label('VRU_AGE_GROUP',    row.get('VRU_AGE_GROUP')),
+            'gait':       _label('VRU_GAIT',         row.get('VRU_GAIT')),
+            'group_size': _label('VRU_GROUP_SIZE',   row.get('VRU_GROUP_SIZE')),
+        }
+
+        primary_tid = _normalize_tid(row.get('PRIMARY_TRACK_ID'))
+        if primary_tid is None:
+            continue
+        track_ids = [primary_tid]
+
+        linked_raw = row.get('LINKED_TRACKS', '')
+        if not pd.isna(linked_raw):
+            linked_str = str(linked_raw).strip()
+            if linked_str and linked_str.lower() != 'nan':
+                for t in linked_str.split(','):
+                    tid = _normalize_tid(t)
+                    if tid:
+                        track_ids.append(tid)
+
+        for fr in range(f0, f1 + 1):
+            for tid in track_ids:
+                enc_meta[(tid, fr)] = meta
+
+    return enc_meta
+
+
+def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
+    """Une ligne par détection autodetect dont (track_id, frame) ∈ enc_meta.
+
+    Bbox reconstruite comme dans overlay_annotations.py : w = 0.45 * h.
+    Distance prédite par le modèle joblib (batch). Colonnes :
+        frame, track_id, x1, y1, x2, y2, foot_x, foot_y, bbox_height, distance_m,
+        VRU_TYPE_LABEL, INTERACTION_LABEL,
+        VRU_AGE_GROUP_LABEL, VRU_GAIT_LABEL, VRU_GROUP_SIZE_LABEL
+    """
+    cols = [
+        'frame', 'track_id', 'x1', 'y1', 'x2', 'y2',
+        'foot_x', 'foot_y', 'bbox_height', 'distance_m',
+        'VRU_TYPE_LABEL', 'INTERACTION_LABEL',
+        'VRU_AGE_GROUP_LABEL', 'VRU_GAIT_LABEL', 'VRU_GROUP_SIZE_LABEL',
+    ]
+    if not autodet_csv or not os.path.exists(autodet_csv) or not enc_meta:
+        return pd.DataFrame(columns=cols)
+
+    with open(autodet_csv) as f:
+        first = f.readline()
+    sep = ';' if first.count(';') > first.count(',') else ','
+
+    df = pd.read_csv(autodet_csv, sep=sep)
+    df.columns = df.columns.str.strip()
+
+    required = {'frame', 'track_id', 'foot_x', 'foot_y', 'bbox_height'}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"   ⚠  Colonnes autodetect manquantes : {missing}")
+        return pd.DataFrame(columns=cols)
+
+    df = df.copy()
+    df['frame']       = pd.to_numeric(df['frame'],       errors='coerce')
+    df['foot_x']      = pd.to_numeric(df['foot_x'],      errors='coerce')
+    df['foot_y']      = pd.to_numeric(df['foot_y'],      errors='coerce')
+    df['bbox_height'] = pd.to_numeric(df['bbox_height'], errors='coerce')
+    df = df.dropna(subset=['frame', 'foot_x', 'foot_y', 'bbox_height'])
+    df['frame']    = df['frame'].astype(int)
+    # Normaliser le track_id en place (évite la colonne dupliquée)
+    df['track_id'] = df['track_id'].apply(_normalize_tid)
+    df = df[df['track_id'].notna()]
+
+    # Filtrage par appartenance à un encounter confirmé
+    metas = [enc_meta.get((tid, fr)) for tid, fr in zip(df['track_id'], df['frame'])]
+    df['_meta'] = metas
+    df = df[df['_meta'].notna()].reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Bbox reconstruite (identique à overlay_annotations.py)
+    bw = df['bbox_height'] * 0.45
+    df['x1'] = (df['foot_x'] - bw / 2).astype(int)
+    df['y1'] = (df['foot_y'] - df['bbox_height']).astype(int)
+    df['x2'] = (df['foot_x'] + bw / 2).astype(int)
+    df['y2'] = df['foot_y'].astype(int)
+
+    # Prédiction batchée
+    bboxes = list(zip(df['x1'], df['y1'], df['x2'], df['y2']))
+    if _oa_predict_distances is not None and bboxes:
+        try:
+            distances = _oa_predict_distances(bboxes)
+        except Exception as e:
+            print(f"   ⚠  Échec predict_distances : {e}")
+            distances = [None] * len(bboxes)
+    else:
+        distances = [None] * len(bboxes)
+
+    df['distance_m']           = distances
+    df['VRU_TYPE_LABEL']       = [m.get('vtype')      or 'Unknown' for m in df['_meta']]
+    df['INTERACTION_LABEL']    = [m.get('itype')      or 'Unknown' for m in df['_meta']]
+    df['VRU_AGE_GROUP_LABEL']  = [m.get('age')        or 'Unknown' for m in df['_meta']]
+    df['VRU_GAIT_LABEL']       = [m.get('gait')       or 'Unknown' for m in df['_meta']]
+    df['VRU_GROUP_SIZE_LABEL'] = [m.get('group_size') or 'Unknown' for m in df['_meta']]
+
+    return df[cols].reset_index(drop=True)
+
+
+def build_frame_level_from_detections(det_df: pd.DataFrame) -> pd.DataFrame:
+    """Agrège un DataFrame "une ligne par bbox confirmée" en frame-level.
+
+    Mêmes colonnes que `build_frame_level_from_debug_encounters`, plus :
+        n_vru_visible, min_distance_m, mean_distance_m, max_distance_m
+    Différence sémantique : on compte les **vraies détections** par frame, pas
+    les events actifs sur cette frame (donc pas de comptage des frames d'un
+    encounter où le VRU n'est pas détecté).
+    """
+    base_cols = ['frame']
+    if det_df is None or det_df.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    df = det_df.copy()
+
+    # Flags de comptage (mêmes définitions que la version "encounters")
+    vt = df['VRU_TYPE_LABEL']
+    it = df['INTERACTION_LABEL']
+    ag = df['VRU_AGE_GROUP_LABEL']
+    ga = df['VRU_GAIT_LABEL']
+    gs = df['VRU_GROUP_SIZE_LABEL']
+
+    df['_is_pedestrian']         = (vt == 'Pedestrian').astype(int)
+    df['_is_elderly']            = (ag == 'Elderly').astype(int)
+    df['_is_child']              = (ag == 'Child').astype(int)
+    df['_is_standing']           = ((ga == 'Standing') | (it == 'Stationary')).astype(int)
+    df['_is_running']            = ((ga == 'Running') & (it != 'Stationary')).astype(int)
+    df['_is_group']              = (gs == 'Group (3+)').astype(int)
+    df['_is_crossing']           = (it == 'Crossing').astype(int)
+    df['_is_ped_crossing']       = ((vt == 'Pedestrian') & (it == 'Crossing')).astype(int)
+    df['_is_ped_opposite']       = ((vt == 'Pedestrian') & (it == 'Opposite-direction')).astype(int)
+    df['_is_ped_same_direction'] = ((vt == 'Pedestrian') & (it == 'Same-direction')).astype(int)
+    df['_is_ped_stationary']     = ((vt == 'Pedestrian') & (it == 'Stationary')).astype(int)
+    df['_is_cyclist_crossing']   = ((vt == 'Cyclist') & (it == 'Crossing')).astype(int)
+
+    # ── Comptages par frame ───────────────────────────────────────────────────
+    total_per_frame = df.groupby('frame').size().rename('n_vru_total')
+    n_visible       = df.groupby('frame').size().rename('n_vru_visible')
+    ped_per_frame   = df[vt == 'Pedestrian'].groupby('frame').size().rename('n_pedestrians')
+    cyc_per_frame   = df[vt == 'Cyclist'].groupby('frame').size().rename('n_cyclists')
+    esc_per_frame   = df[vt == 'E-scooter'].groupby('frame').size().rename('n_escooters')
+
+    # ── Proportions ───────────────────────────────────────────────────────────
+    vru_counts = df.groupby(['frame', 'VRU_TYPE_LABEL']).size().unstack(fill_value=0)
+    vru_props  = vru_counts.div(vru_counts.sum(axis=1), axis=0).rename(
+        columns=lambda c: f'prop_vru_{normalize_label(c)}'
+    )
+    inter_counts = df.groupby(['frame', 'INTERACTION_LABEL']).size().unstack(fill_value=0)
+    inter_props  = inter_counts.div(inter_counts.sum(axis=1), axis=0).rename(
+        columns=lambda c: f'prop_interaction_{normalize_label(c)}'
+    )
+
+    # ── Comptages par flag ────────────────────────────────────────────────────
+    flag_cols = {
+        '_is_elderly':            'n_elderly',
+        '_is_child':              'n_children',
+        '_is_standing':           'n_standing',
+        '_is_running':            'n_running',
+        '_is_group':              'n_groups',
+        '_is_crossing':           'n_crossing',
+        '_is_ped_crossing':       'n_pedestrians_crossing',
+        '_is_ped_opposite':       'n_pedestrians_opposite',
+        '_is_ped_same_direction': 'n_pedestrians_same_direction',
+        '_is_ped_stationary':     'n_pedestrians_stationary',
+        '_is_cyclist_crossing':   'n_cyclists_crossing',
+    }
+    count_series = {
+        name: df.groupby('frame')[flag].sum().rename(name)
+        for flag, name in flag_cols.items() if flag in df.columns
+    }
+
+    # ── Distance aggregates (par frame) ───────────────────────────────────────
+    # groupby ignore les NaN pour min/mean/max → si toutes les distances sont NaN
+    # on obtient une Series de NaN avec le bon index 'frame' (pas un Series vide
+    # anonyme qui casserait le reset_index() en aval).
+    g_dist = df.groupby('frame')['distance_m']
+    min_dist  = g_dist.min().rename('min_distance_m')
+    mean_dist = g_dist.mean().rename('mean_distance_m')
+    max_dist  = g_dist.max().rename('max_distance_m')
+
+    out = pd.concat(
+        [
+            total_per_frame, n_visible,
+            ped_per_frame, cyc_per_frame, esc_per_frame,
+            vru_props, inter_props,
+            *count_series.values(),
+            min_dist, mean_dist, max_dist,
+        ],
+        axis=1,
+    ).reset_index()
+
+    # Casting / défauts
+    int_cols = ['n_vru_total', 'n_vru_visible', 'n_pedestrians', 'n_cyclists',
+                'n_escooters'] + list(flag_cols.values())
+    for col in int_cols:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = out[col].fillna(0).astype(int)
+
+    expected_vru_cols = [
+        'prop_vru_pedestrian', 'prop_vru_cyclist', 'prop_vru_e_scooter',
+        'prop_vru_other_mmv', 'prop_vru_motor', 'prop_vru_animal',
+        'prop_vru_stationary', 'prop_vru_unknown',
+    ]
+    expected_inter_cols = [
+        'prop_interaction_same_direction', 'prop_interaction_opposite_direction',
+        'prop_interaction_crossing', 'prop_interaction_stationary',
+        'prop_interaction_unknown',
+    ]
+    for col in expected_vru_cols + expected_inter_cols:
+        if col not in out.columns:
+            out[col] = 0.0
+
+    # ── Labels contextuels (première valeur disponible par frame) ─────────────
+    context_cols = ['VRU_AGE_GROUP_LABEL', 'VRU_GAIT_LABEL', 'VRU_GROUP_SIZE_LABEL']
+    for col in context_cols:
+        if col in df.columns:
+            ctx = df.groupby('frame')[col].agg(
+                lambda s: s.dropna().iloc[0] if s.dropna().size else np.nan
+            )
+            out = out.merge(ctx.rename(col), on='frame', how='left')
+
+    # ── start_crossing : première frame où chaque track ped-crossing apparaît ─
+    if 'track_id' in df.columns:
+        ped_cross = df[(vt == 'Pedestrian') & (it == 'Crossing')]
+        if not ped_cross.empty:
+            first_per_track = ped_cross.groupby('track_id')['frame'].min()
+            start_pairs = set(zip(first_per_track.index.astype(str),
+                                  first_per_track.values.astype(int)))
+            out_sorted = out.sort_values('frame').reset_index(drop=True)
+            # Une frame est "start_crossing" s'il existe un track ped-crossing
+            # qui commence sur cette frame.
+            ped_cross_frames = set(first_per_track.values.astype(int))
+            out_sorted['start_crossing'] = out_sorted['frame'].isin(ped_cross_frames).astype(int)
+            out = out_sorted
+        else:
+            out['start_crossing'] = 0
+    else:
+        out['start_crossing'] = 0
+
+    return out
+
 
 def build_frame_level_from_debug_encounters(df_codebook: pd.DataFrame) -> pd.DataFrame:
     """
@@ -960,6 +1351,7 @@ def load_intersection_intervals_for_prefix(prefix: str, intersections_csv: str) 
 
 
 all_rows = []
+all_detections = []          # bbox-level (une ligne par détection confirmée)
 seen_prefixes = set()
 for enc_path in sorted(encounter_files):
     prefix = extract_prefix(enc_path)
@@ -983,11 +1375,22 @@ for enc_path in sorted(encounter_files):
     obs_intervals      = load_obstacle_intervals(df_obstacles)
     inter_intervals    = load_intersection_intervals_for_prefix(prefix, INTERSECTIONS_CSV)
 
+    # Détections autodetect + filtrage par encounters confirmés (cf. overlay_annotations.py)
+    enc_csv_path     = find_enc_csv_path(prefix, CODEBOOK_DIR)
+    autodet_csv_path = find_autodet_csv_path(prefix, CODEBOOK_DIR)
+    enc_meta_full    = load_enc_meta_full(enc_csv_path) if enc_csv_path else {}
+    det_df           = load_vrus_with_distance(autodet_csv_path, enc_meta_full)
+
     print(f"\n▶  {prefix}")
     print(f"   IMU           : {os.path.basename(imu_path)}")
     print(f"   Obstacles     : {os.path.basename(obs_candidates[0]) if obs_candidates else 'aucun'}")
     print(f"   Intersections : {len(inter_intervals)} intervalle(s)")
+    print(f"   Autodetect    : {os.path.basename(autodet_csv_path) if autodet_csv_path else 'aucun'}")
+    n_with_dist = int(det_df['distance_m'].notna().sum()) if not det_df.empty else 0
+    print(f"   Détections    : {len(det_df)} bbox confirmées  (distance prédite : {n_with_dist})")
 
+    # df_codebook : utilisé pour load_session_context, déjà via load_codebook_annotated
+    # ci-dessous. On garde l'appel pour le log "Codebook  : … lignes confirmées".
     df_codebook    = load_codebook_annotated(prefix, CODEBOOK_DIR)
     session_ctx    = load_session_context(prefix, CODEBOOK_DIR)
 
@@ -1012,6 +1415,34 @@ for enc_path in sorted(encounter_files):
 
         imu["frame_corrected"] = imu["frame"] - GPS_OFFSET_FRAMES
 
+        # ── Steering (cf. overlay_annotations.py) ─────────────────────────────
+        # GyrZ moyen par frame brute (le CSV IMU a plusieurs lignes/frame),
+        # exactement comme overlay_annotations.load_gyrz_by_frame, puis choix
+        # de direction (straight/left/right) par fenêtre de 1 s sur Δyaw.
+        # Le résultat est ramené dans l'espace frame_corrected (− offset GPS)
+        # pour s'aligner sur frame_df, comme la jointure IMU plus bas.
+        steer_df = pd.DataFrame(columns=["frame", "steering_choice", "delta_yaw_deg"])
+        n_steer_left = n_steer_right = 0
+        if _oa_compute_steering is not None:
+            gyrz_by_frame = (
+                imu.dropna(subset=["GyrZ(deg/s)"])
+                   .groupby("frame")["GyrZ(deg/s)"]
+                   .mean()
+                   .to_dict()
+            )
+            steering_choices = _oa_compute_steering(gyrz_by_frame, VIDEO_FPS)
+            if steering_choices:
+                steer_df = pd.DataFrame(
+                    [(fr - GPS_OFFSET_FRAMES, lbl, dy)
+                     for fr, (lbl, dy) in steering_choices.items()],
+                    columns=["frame", "steering_choice", "delta_yaw_deg"],
+                )
+                if _oa_count_steering is not None:
+                    n_steer_left, n_steer_right = _oa_count_steering(steering_choices)
+        print(f"   Steering  : L/R = {n_steer_left}/{n_steer_right}  "
+              f"(fenêtre {STEERING_PIE_WINDOW_S:.0f}s, "
+              f"seuil {STEERING_PIE_THRESHOLD_DEG:.0f}°)")
+
         valid_frames = set(
             imu.loc[
                 imu["GyrZ(deg/s)"].isna() | (imu["GyrZ(deg/s)"].abs() <= TURN_THRESHOLD_DEG_S),
@@ -1019,7 +1450,9 @@ for enc_path in sorted(encounter_files):
             ]
         )
 
-        frame_df = build_frame_level_from_debug_encounters(df_codebook)
+        # Frame-level construit à partir des VRAIES détections autodetect
+        # (et non des intervalles d'encounters), comme overlay_annotations.py.
+        frame_df = build_frame_level_from_detections(det_df)
 
         # Injecter les attributs de session depuis le fichier encounters normal
         for col_label, value in session_ctx.items():
@@ -1035,7 +1468,7 @@ for enc_path in sorted(encounter_files):
 
         n0 = len(frame_df)
         if frame_df.empty:
-            print("   ℹ  Aucune frame issue de debug_encounters")
+            print("   ℹ  Aucune détection autodetect confirmée (frame_df vide)")
             continue
 
         # speed_kmh_t1 : vitesse IMU à la frame suivante, même source uniquement.
@@ -1044,17 +1477,29 @@ for enc_path in sorted(encounter_files):
         frame_df["speed_kmh_t1"] = frame_df["frame"].add(1).map(speed_map)
 
         frame_df = frame_df[frame_df["frame"].isin(valid_frames)].copy()
+        # Mêmes filtres appliqués au DataFrame des détections (bbox-level)
+        if not det_df.empty:
+            det_df = det_df[det_df["frame"].isin(valid_frames)].copy()
         print(f"   Virages   : {n0 - len(frame_df):>4} lignes retirées → {len(frame_df)} restantes")
 
         n1 = len(frame_df)
         if obs_intervals:
             mask_obs  = ~frame_df["frame"].apply(lambda f: frame_in_obstacle(f, obs_intervals))
             frame_df  = frame_df.loc[mask_obs].copy()
+            if not det_df.empty:
+                det_mask = ~det_df["frame"].apply(lambda f: frame_in_obstacle(f, obs_intervals))
+                det_df   = det_df.loc[det_mask].copy()
         print(f"   Obstacles : {n1 - len(frame_df):>4} lignes retirées → {len(frame_df)} restantes")
 
         if frame_df.empty:
             print("   ℹ  Plus aucune frame après filtrage")
             continue
+
+        # Persister les détections (bbox-level) une fois filtrées
+        if not det_df.empty:
+            det_df = det_df.copy()
+            det_df.insert(0, "source", prefix)
+            all_detections.append(det_df)
 
         # Forcer NaN sur la dernière frame restante par source (pas de t+1 garanti
         # dans la même source après concaténation).
@@ -1071,15 +1516,26 @@ for enc_path in sorted(encounter_files):
             })
         )
         frame_df = frame_df.merge(imu_sub, on="frame", how="left")
+
+        # Jointure steering (choix de direction par fenêtre de 1 s)
+        frame_df = frame_df.merge(steer_df, on="frame", how="left")
+
         frame_df.insert(0, "source", prefix)
 
         keep = [
     "source", "frame",
     "speed_kmh", "speed_kmh_t1", "gyrz_deg_s",
+    # Steering (Δyaw intégré sur 1 s, cf. overlay_annotations.py)
+    "steering_choice", "delta_yaw_deg",
     "n_vru_total",
+    "n_vru_visible",
     "n_pedestrians",
     "n_cyclists",
     "n_escooters",
+    # Distance (modèle bbox → m)
+    "min_distance_m",
+    "mean_distance_m",
+    "max_distance_m",
     "prop_vru_pedestrian",
     "prop_vru_cyclist",
     "prop_vru_e_scooter",
@@ -1125,7 +1581,9 @@ for enc_path in sorted(encounter_files):
         print(f"   ✔  {len(frame_df)} lignes ajoutées")
 
     except Exception as exc:
+        import traceback
         print(f"   ❌ Erreur : {exc}")
+        traceback.print_exc()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1265,6 +1723,20 @@ else:
     dataset = dataset.sort_values(sort_cols).reset_index(drop=True)
 
     dataset.to_csv(OUTPUT_FILE, index=False)
+
+    # ── Export bbox-level (une ligne par détection confirmée + distance) ──
+    if all_detections:
+        detections = pd.concat(all_detections, ignore_index=True)
+        detections = detections.sort_values(["source", "frame", "track_id"]).reset_index(drop=True)
+        detections.to_csv(DETECTIONS_FILE, index=False)
+        n_det      = len(detections)
+        n_with_dist = int(detections["distance_m"].notna().sum())
+        print(f"\nDétections (bbox-level) exportées : {DETECTIONS_FILE}")
+        print(f"  Lignes              : {n_det}")
+        print(f"  Distances prédites  : {n_with_dist} ({100*n_with_dist/max(n_det,1):.1f} %)")
+        print(f"  Trajets             : {detections['source'].nunique()}")
+    else:
+        print("\n⚠  Aucune détection bbox-level — fichier détections non exporté")
 
     print(f"\nDataset exporté  : {OUTPUT_FILE}")
     print(f"  Lignes         : {len(dataset)}")

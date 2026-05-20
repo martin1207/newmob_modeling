@@ -26,13 +26,21 @@ ESCOOTER_DIR  = f"{ROOT}/escooter"
 CODEBOOK      = f"{ROOT}/codebookescooter"
 OUT_DIR       = f"{ROOT}/e_scooter_video_annotated"
 
-ENC_SUFFIX     = "_rater1_encounters_debug_encounters.csv"
-OBS_SUFFIX     = "_rater1_encounters_obstacle_zones.csv"
+ENC_SUFFIX     = "_rater2_encounters_debug_encounters.csv"
+OBS_SUFFIX     = "_rater2_encounters_obstacle_zones.csv"
 AUTODET_SUFFIX = "_debug_autodetect.csv"
 SPEED_SUFFIX   = "_corrected_with_offset.csv"   # IMU + GPS dans <ESCOOTER_DIR>
+VIDEO_SUFFIX   = "_canny.mp4"                   # vidéo source (filtre Canny)
 OUT_SUFFIX     = "_annotated_codes.mp4"
 
 OVERWRITE = False   # True pour recalculer même si l'output existe déjà
+
+# ── Camembert de direction (choix par seconde, basé sur Δyaw = ∫GyrZ dt) ────
+STEERING_PIE_WINDOW_S      = 1.0   # fenêtre d'évaluation du choix de direction (s)
+STEERING_PIE_THRESHOLD_DEG = 10.0  # |Δyaw| sur la fenêtre < seuil ⇒ "tout droit"
+                                   # sinon : 'gauche' si Δyaw > 0, sinon 'droite'
+GYRZ_LEFT_POSITIVE         = True  # convention : True si GyrZ > 0 ⇒ virage à gauche
+                                   # (à inverser si l'overlay annote l'inverse)
 
 # ── Modèle de distance (bbox → mètres) ───────────────────────────────────────
 DISTANCE_MODEL_PATH = (
@@ -210,6 +218,99 @@ def load_speed_by_frame(speed_csv):
     return speed
 
 
+def load_gyrz_by_frame(speed_csv):
+    """{frame: GyrZ moyen (deg/s)} — moyenne des échantillons IMU rattachés à la frame.
+
+    Le CSV IMU peut contenir plusieurs lignes par frame vidéo : on agrège par
+    moyenne pour avoir un signal aligné au framerate vidéo avant filtrage.
+    """
+    raw = {}
+    if not os.path.exists(speed_csv):
+        return {}
+    f, reader = _open_dictreader(speed_csv)
+    with f:
+        for row in reader:
+            try:
+                fr = int(float(row["frame"]))
+                g  = float(row["GyrZ(deg/s)"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            raw.setdefault(fr, []).append(g)
+    return {fr: float(np.mean(vs)) for fr, vs in raw.items()}
+
+
+def compute_steering_choices_per_second(gyrz_by_frame, fps,
+                                        window_s=STEERING_PIE_WINDOW_S,
+                                        threshold_deg=STEERING_PIE_THRESHOLD_DEG,
+                                        left_positive=GYRZ_LEFT_POSITIVE):
+    """{frame: ('straight'|'left'|'right', delta_yaw_deg)} — choix par fenêtre.
+
+    On découpe le signal GyrZ en fenêtres consécutives de `window_s` secondes,
+    et pour chaque fenêtre on calcule Δyaw = ∫ (GyrZ − biais) dt sur la fenêtre.
+    Classification :
+      • |Δyaw| < `threshold_deg`           → 'straight'
+      • Δyaw > 0  (avec gauche = positif)  → 'left'
+      • Δyaw < 0                           → 'right'
+
+    Le choix est ensuite "tenu" sur toutes les frames de la fenêtre — le
+    camembert affiche donc le même secteur pendant ~1 s puis change.
+
+    Débiaisage : on retire la médiane globale du signal (robuste : la médiane
+    n'est pas tirée par les virages, contrairement à la moyenne).
+    """
+    if not gyrz_by_frame:
+        return {}
+    frames = sorted(gyrz_by_frame)
+    fmin, fmax = frames[0], frames[-1]
+    n = fmax - fmin + 1
+    arr = np.full(n, np.nan)
+    for fr, g in gyrz_by_frame.items():
+        arr[fr - fmin] = g
+    # Interpolation linéaire des frames manquantes
+    if np.isnan(arr).any():
+        idx = np.arange(n)
+        ok  = ~np.isnan(arr)
+        if ok.sum() >= 2:
+            arr = np.interp(idx, idx[ok], arr[ok])
+        else:
+            arr = np.nan_to_num(arr)
+    # Débiaisage par la médiane + signe (gauche = positif)
+    arr = arr - float(np.median(arr))
+    if not left_positive:
+        arr = -arr
+
+    # Découpage en fenêtres de window_s ≈ frames_per_window frames
+    frames_per_window = max(1, int(round(window_s * fps)))
+    dt = 1.0 / max(fps, 1e-6)
+
+    choices = {}
+    for i0 in range(0, n, frames_per_window):
+        i1 = min(i0 + frames_per_window, n)
+        delta_yaw = float(np.sum(arr[i0:i1]) * dt)   # intégration trapézoïdale ≈
+        if abs(delta_yaw) < threshold_deg:
+            label = 'straight'
+        elif delta_yaw > 0:
+            label = 'left'
+        else:
+            label = 'right'
+        for i in range(i0, i1):
+            choices[fmin + i] = (label, delta_yaw)
+    return choices
+
+
+def count_steering_maneuvers(choices_by_frame):
+    """(n_left, n_right) — nombre de fenêtres distinctes classées 'left' / 'right'."""
+    n_left = n_right = 0
+    last_label = None
+    for fr in sorted(choices_by_frame):
+        label = choices_by_frame[fr][0]
+        if label != last_label:
+            if   label == 'left':  n_left  += 1
+            elif label == 'right': n_right += 1
+        last_label = label
+    return n_left, n_right
+
+
 def load_obstacle_zones(obs_csv):
     """Liste de (frame_start, frame_end, zone_id) ou [] si fichier absent."""
     zones = []
@@ -322,6 +423,89 @@ def draw_speed(frame, speed_kmh):
     cv2.putText(frame, text, (x, y), FONT, scale, (0, 220, 0), thick, cv2.LINE_AA)
 
 
+def draw_steering_pie(frame, choice):
+    """Quart de cadran à 3 secteurs (apex en bas, éventail ouvert vers le haut).
+
+    `choice` est soit None, soit ('straight'|'left'|'right', delta_yaw_deg).
+    Éventail de 90° centré sur la verticale "up" (secteur OpenCV 225° → 315°),
+    découpé en 3 secteurs de 30° :
+      • LEFT     (225° → 255°)
+      • STRAIGHT (255° → 285°)
+      • RIGHT    (285° → 315°)
+    Le secteur "choisi" est rempli de couleur vive ; les autres restent grisés.
+    """
+    w  = frame.shape[1]
+    r  = 90
+    cx = w // 2
+    cy = r + 22                  # apex sous la courbe → l'éventail tient en haut
+
+    # En OpenCV : angle 0° = +x (droite), 90° = +y (bas), 270° = haut
+    sectors = [
+        ('left',     225, 255),
+        ('straight', 255, 285),
+        ('right',    285, 315),
+    ]
+    COLOR_ON = {
+        'straight': ( 80, 220,  80),   # vert
+        'left':     (255, 200,   0),   # cyan-bleu (BGR)
+        'right':    (  0, 165, 255),   # orange
+    }
+    COLOR_OFF = (55, 55, 55)
+
+    label = None if choice is None else choice[0]
+
+    # Halo noir (lisibilité sur n'importe quel fond)
+    cv2.ellipse(frame, (cx, cy), (r + 5, r + 5), 0, 225, 315, BLACK,
+                -1, cv2.LINE_AA)
+
+    # Remplissage des 3 secteurs
+    for name, a0, a1 in sectors:
+        color = COLOR_ON[name] if name == label else COLOR_OFF
+        cv2.ellipse(frame, (cx, cy), (r, r), 0, a0, a1, color, -1, cv2.LINE_AA)
+
+    # Séparateurs (rayons depuis l'apex) + arc extérieur
+    for a in (225, 255, 285, 315):
+        rad = np.deg2rad(a)
+        x2 = cx + int(r * np.cos(rad))
+        y2 = cy + int(r * np.sin(rad))
+        cv2.line(frame, (cx, cy), (x2, y2), (220, 220, 220), 2, cv2.LINE_AA)
+    cv2.ellipse(frame, (cx, cy), (r, r), 0, 225, 315, (220, 220, 220),
+                2, cv2.LINE_AA)
+
+    # Petite flèche dans chaque secteur, au centre angulaire (rayon ~0.62 r)
+    arrow_color = (240, 240, 240)
+    rr  = int(r * 0.62)
+    arm = 16
+    # LEFT : flèche vers la gauche, centrée sur l'angle 240°
+    px = cx + int(rr * np.cos(np.deg2rad(240)))
+    py = cy + int(rr * np.sin(np.deg2rad(240)))
+    cv2.arrowedLine(frame, (px + arm, py), (px - arm, py),
+                    arrow_color, 3, cv2.LINE_AA, tipLength=0.5)
+    # STRAIGHT : flèche vers le haut, centrée sur l'angle 270°
+    px = cx
+    py = cy + int(rr * np.sin(np.deg2rad(270)))   # cy - rr
+    cv2.arrowedLine(frame, (px, py + arm), (px, py - arm),
+                    arrow_color, 3, cv2.LINE_AA, tipLength=0.5)
+    # RIGHT : flèche vers la droite, centrée sur l'angle 300°
+    px = cx + int(rr * np.cos(np.deg2rad(300)))
+    py = cy + int(rr * np.sin(np.deg2rad(300)))
+    cv2.arrowedLine(frame, (px - arm, py), (px + arm, py),
+                    arrow_color, 3, cv2.LINE_AA, tipLength=0.5)
+
+    # Bandeau texte sous l'éventail : choix courant + Δyaw
+    if choice is not None:
+        name, dyaw = choice
+        txt = f"{name.upper()}  ({dyaw:+.0f} deg / {STEERING_PIE_WINDOW_S:.0f}s)"
+    else:
+        txt = "-"
+    (tw, th), _ = cv2.getTextSize(txt, FONT, 0.55, 1)
+    bx, by = cx - tw // 2, cy + 22
+    cv2.rectangle(frame, (bx - 6, by - th - 4), (bx + tw + 6, by + 4),
+                  BLACK, -1)
+    cv2.putText(frame, txt, (bx, by), FONT, 0.55,
+                (255, 255, 255), 1, cv2.LINE_AA)
+
+
 def draw_obstacle_banner(frame, zone_id):
     h, w = frame.shape[:2]
     text = f"OBSTACLE [{zone_id}]"
@@ -334,7 +518,7 @@ def draw_obstacle_banner(frame, zone_id):
 
 
 def process_clip(clip_name):
-    video_in    = f"{ESCOOTER_DIR}/{clip_name}.mp4"
+    video_in    = f"{ESCOOTER_DIR}/{clip_name}{VIDEO_SUFFIX}"
     autodet_csv = f"{CODEBOOK}/{clip_name}{AUTODET_SUFFIX}"
     enc_csv     = f"{CODEBOOK}/{clip_name}{ENC_SUFFIX}"
     obs_csv     = f"{CODEBOOK}/{clip_name}{OBS_SUFFIX}"
@@ -354,6 +538,7 @@ def process_clip(clip_name):
     vrus_by_frame  = load_vrus_by_frame(autodet_csv, enc_meta)
     obstacles      = load_obstacle_zones(obs_csv)
     speed_by_frame = load_speed_by_frame(speed_csv)
+    gyrz_by_frame  = load_gyrz_by_frame(speed_csv)
     n_boxes = sum(len(v) for v in vrus_by_frame.values())
     if n_boxes == 0 and not obstacles:
         print(f"[SKIP] {clip_name} — aucun encounter confirmé ni obstacle")
@@ -367,7 +552,15 @@ def process_clip(clip_name):
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[RUN ] {clip_name}  {width}×{height} @ {fps:.1f}fps  {total}f  bbox={n_boxes}  obs_zones={len(obstacles)}  speed_pts={len(speed_by_frame)}")
+
+    # Choix de direction par fenêtre de 1 s (straight / left / right) à partir
+    # du yaw intégré sur la fenêtre.
+    choices_by_frame = compute_steering_choices_per_second(gyrz_by_frame, fps)
+    n_left, n_right  = count_steering_maneuvers(choices_by_frame)
+
+    print(f"[RUN ] {clip_name}  {width}×{height} @ {fps:.1f}fps  {total}f  "
+          f"bbox={n_boxes}  obs_zones={len(obstacles)}  "
+          f"speed_pts={len(speed_by_frame)}  steer L/R={n_left}/{n_right}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out    = cv2.VideoWriter(video_out, fourcc, fps, (width, height))
@@ -382,6 +575,8 @@ def process_clip(clip_name):
         zid = obstacle_id_at(frame_idx, obstacles)
         if zid is not None:
             draw_obstacle_banner(frame, zid)
+        # Camembert de direction (toujours dessiné, même si pas de signal IMU)
+        draw_steering_pie(frame, choices_by_frame.get(frame_idx))
         draw_frame_number(frame, frame_idx, total)
         v = speed_by_frame.get(frame_idx)
         if v is not None:
@@ -395,13 +590,13 @@ def process_clip(clip_name):
 
 
 def discover_clips():
-    """Clips ayant à la fois encounters + autodetect + vidéo."""
+    """Clips ayant à la fois encounters + autodetect + vidéo Canny."""
     enc_files = glob.glob(f"{CODEBOOK}/*{ENC_SUFFIX}")
     clips = []
     for p in enc_files:
         name = os.path.basename(p)[: -len(ENC_SUFFIX)]
         if (os.path.exists(f"{CODEBOOK}/{name}{AUTODET_SUFFIX}")
-                and os.path.exists(f"{ESCOOTER_DIR}/{name}.mp4")):
+                and os.path.exists(f"{ESCOOTER_DIR}/{name}{VIDEO_SUFFIX}")):
             clips.append(name)
     return sorted(clips)
 
