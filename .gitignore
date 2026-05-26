@@ -1,0 +1,61 @@
+# ======================
+# macOS
+# ======================
+.DS_Store
+._*
+
+# ======================
+# Vidéos
+# ======================
+*.mp4
+
+*.tex
+*.iter
+*.png
+*.json
+*.html
+*.bak
+*encounters.csv
+clean_dataset.csv
+clean_dataset_vru_detections.csv
+
+# ======================
+# Python
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ======================
+# Environnements
+# ======================
+.venv/
+venv/
+env/
+
+# ======================
+# Logs
+# ======================
+*.log
+
+# ======================
+# Données & outputs (YOLO)
+# ======================
+data/
+runs/
+datasets/
+outputs/
+
+# ======================
+# Jupyter
+# ======================
+.ipynb_checkpoints/
+
+# ======================
+# VS Code
+# ======================
+.vscode/

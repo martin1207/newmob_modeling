@@ -104,6 +104,16 @@ def _selftest_distance_model():
 _DIST_MODEL_OK = _selftest_distance_model()
 
 
+# ── Géométrie caméra (azimut VRU) ────────────────────────────────────────────
+# FOV horizontale supposée constante : pas de calibration par clip chargée
+# (pour rester aligné sur la demande). Ajuster IMAGE_WIDTH_PX / HFOV_DEG si
+# les vidéos sources ont une résolution/optique différente.
+IMAGE_WIDTH_PX = 1920
+HFOV_DEG       = 90.0
+# Focale équivalente (px) déduite du modèle sténopé : f = (W/2) / tan(HFOV/2)
+_FOCAL_PX = (IMAGE_WIDTH_PX / 2.0) / math.tan(math.radians(HFOV_DEG) / 2.0)
+
+
 # ── Mapping codes ────────────────────────────────────────────────────────────
 CODE_LABELS = {
     "CONFIRM":           {"0": "Reject", "1": "Accept", "2": "Review"},
@@ -494,12 +504,18 @@ def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
     Bbox reconstruite comme dans overlay_annotations.py : w = 0.45 * h.
     Distance prédite par le modèle joblib (batch). Colonnes :
         frame, track_id, x1, y1, x2, y2, foot_x, foot_y, bbox_height, distance_m,
+        cx_px, azimuth_deg,
         VRU_TYPE_LABEL, INTERACTION_LABEL,
         VRU_AGE_GROUP_LABEL, VRU_GAIT_LABEL, VRU_GROUP_SIZE_LABEL
+
+    azimuth_deg : angle horizontal du VRU par rapport à l'axe avant de
+    l'e-scooter (modèle sténopé, FOV constante). Positif = à droite,
+    négatif = à gauche. Cf. constantes IMAGE_WIDTH_PX / HFOV_DEG.
     """
     cols = [
         'frame', 'track_id', 'x1', 'y1', 'x2', 'y2',
         'foot_x', 'foot_y', 'bbox_height', 'distance_m',
+        'cx_px', 'azimuth_deg',
         'VRU_TYPE_LABEL', 'INTERACTION_LABEL',
         'VRU_AGE_GROUP_LABEL', 'VRU_GAIT_LABEL', 'VRU_GROUP_SIZE_LABEL',
     ]
@@ -556,6 +572,12 @@ def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
         distances = [None] * len(bboxes)
 
     df['distance_m']           = distances
+
+    # Azimut horizontal (deg) — modèle sténopé, point principal = centre image
+    df['cx_px']       = (df['x1'] + df['x2']) / 2.0
+    df['azimuth_deg'] = np.degrees(np.arctan2(
+        df['cx_px'] - IMAGE_WIDTH_PX / 2.0, _FOCAL_PX))
+
     df['VRU_TYPE_LABEL']       = [m.get('vtype')      or 'Unknown' for m in df['_meta']]
     df['INTERACTION_LABEL']    = [m.get('itype')      or 'Unknown' for m in df['_meta']]
     df['VRU_AGE_GROUP_LABEL']  = [m.get('age')        or 'Unknown' for m in df['_meta']]

@@ -25,13 +25,27 @@ ROOT          = "/Volumes/My Passport/NEWMOB"
 ESCOOTER_DIR  = f"{ROOT}/escooter"
 CODEBOOK      = f"{ROOT}/codebookescooter"
 OUT_DIR       = f"{ROOT}/e_scooter_video_annotated"
+LANES_DIR     = f"{ROOT}/lanes"
 
-ENC_SUFFIX     = "_rater2_encounters_debug_encounters.csv"
-OBS_SUFFIX     = "_rater2_encounters_obstacle_zones.csv"
+ENC_SUFFIX     = "_rater1_encounters_debug_encounters.csv"
+OBS_SUFFIX     = "_rater1_encounters_obstacle_zones.csv"
 AUTODET_SUFFIX = "_debug_autodetect.csv"
 SPEED_SUFFIX   = "_corrected_with_offset.csv"   # IMU + GPS dans <ESCOOTER_DIR>
-VIDEO_SUFFIX   = "_canny.mp4"                   # vidéo source (filtre Canny)
+VIDEO_SUFFIX   = "_canny.mp4"             # vidéo source (filtre Canny)
 OUT_SUFFIX     = "_annotated_codes.mp4"
+LANES_SUFFIX   = "_corrected_lanes.csv"         # courbes curb gauche/droite
+CALIB_SUFFIX   = "_calibration.json"            # calibration caméra (sténopé)
+
+# Rendu curb : on réutilise STRICTEMENT la logique de render_corrected_lanes.py
+# (clustering, interpolation polynomiale, lissage temporel, polylines+blend).
+from curb_corrector import load_csv as load_lanes_csv, cluster_frame, MIN_CLUSTER_SIZE
+from render_corrected_lanes import (
+    SideTrack, biggest_left_right, curve_keypoints,
+    COLOR_LEFT, COLOR_RIGHT, LINE_THICK,
+)
+CURB_DEGREE     = 2
+CURB_MIN_SIZE   = MIN_CLUSTER_SIZE
+CURB_SMOOTH_WIN = 3
 
 OVERWRITE = False   # True pour recalculer même si l'output existe déjà
 
@@ -311,6 +325,54 @@ def count_steering_maneuvers(choices_by_frame):
     return n_left, n_right
 
 
+def build_curb_tracks(lanes_csv, H, W,
+                      degree=CURB_DEGREE, min_size=CURB_MIN_SIZE,
+                      smooth_win=CURB_SMOOTH_WIN):
+    """(left_tr, right_tr) prêts à interroger via .at(frame_idx), ou (None, None).
+
+    Réplique exacte du pipeline de render_corrected_lanes.render_clip :
+    clusters par frame échantillonnée → plus gros cluster gauche/droite
+    → courbe polynomiale x=f(y) → lissage temporel par SideTrack.
+    """
+    if not os.path.exists(lanes_csv):
+        return None, None
+    frame_pixels = load_lanes_csv(lanes_csv)
+    sampled = sorted(frame_pixels.keys())
+    if not sampled:
+        return None, None
+    left_tr, right_tr = SideTrack(), SideTrack()
+    for fid in sampled:
+        clusters = cluster_frame(frame_pixels[fid], H, W, min_size)
+        left, right = biggest_left_right(clusters, W)
+        left_tr.add(fid,  curve_keypoints(left,  degree) if left  else None)
+        right_tr.add(fid, curve_keypoints(right, degree) if right else None)
+    left_tr.finalize(smooth_win)
+    right_tr.finalize(smooth_win)
+    if not left_tr.any and not right_tr.any:
+        return None, None
+    return left_tr, right_tr
+
+
+def draw_curbs(frame, frame_idx, left_tr, right_tr):
+    """Trace les curbs gauche/droite à la frame `frame_idx` (mêmes couleurs,
+    épaisseur et blend 0.65/0.35 que render_corrected_lanes.py)."""
+    if left_tr is None and right_tr is None:
+        return frame
+    overlay = frame.copy()
+    drawn = False
+    for tr, color in ((left_tr, COLOR_LEFT), (right_tr, COLOR_RIGHT)):
+        if tr is None:
+            continue
+        curve = tr.at(frame_idx)
+        if curve is not None:
+            cv2.polylines(overlay, [curve], False, color,
+                          LINE_THICK, cv2.LINE_AA)
+            drawn = True
+    if not drawn:
+        return frame
+    return cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+
+
 def load_obstacle_zones(obs_csv):
     """Liste de (frame_start, frame_end, zone_id) ou [] si fichier absent."""
     zones = []
@@ -506,6 +568,160 @@ def draw_steering_pie(frame, choice):
                 (255, 255, 255), 1, cv2.LINE_AA)
 
 
+# ── Mini-carte « bird-eye » (vue de dessus) ──────────────────────────────────
+# Projette curbs + piétons dans un repère sol (X = latéral, Z = profondeur)
+# via le modèle sténopé + sol plan de la calibration caméra du clip.
+MINIMAP_W           = 260      # largeur du panneau (px)
+MINIMAP_H           = 300      # hauteur du panneau (px)
+MINIMAP_MARGIN      = 20       # marge au coin haut-droit (px)
+MINIMAP_RANGE_M     = 25.0     # profondeur affichée vers l'avant (m)
+MINIMAP_HALFWIDTH_M = 12.0     # demi-largeur latérale affichée (m)
+MINIMAP_RINGS_M     = (5.0, 10.0, 15.0, 20.0)   # anneaux de distance
+
+
+def load_calibration(path):
+    """Charge le JSON de calibration caméra → dict normalisé, ou None.
+
+    Champs utilisés : focale f (px), point principal (cx, cy), hauteur
+    caméra h_cam (m) et pitch (deg). Modèle sténopé + hypothèse sol plan.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        import json  # import paresseux
+        with open(path) as fh:
+            c = json.load(fh)
+        return {
+            "f":     float(c.get("f") or c.get("focal_length_px")),
+            "cx":    float(c.get("cx", 0.0)),
+            "cy":    float(c.get("cy", 0.0)),
+            "h_cam": float(c.get("h_cam") or c.get("camera_height_m")),
+            "pitch": np.deg2rad(float(c.get("pitch_deg", 0.0))),
+        }
+    except Exception as e:
+        print(f"[WARN] Calibration illisible ({os.path.basename(path)}) : {e}")
+        return None
+
+
+def ground_point(u, v, calib):
+    """Pixel (u, v) supposé au sol → (X, Z) en mètres, ou None.
+
+    X = position latérale (droite positive), Z = profondeur vers l'avant.
+    Renvoie None si le rayon vise l'horizon ou le ciel (pas d'intersection
+    avec le sol). Modèle : caméra sténopé à hauteur h_cam, pitch autour de
+    l'axe latéral, sol plan Y = 0.
+    """
+    xc = (u - calib["cx"]) / calib["f"]
+    yc = (v - calib["cy"]) / calib["f"]
+    p  = calib["pitch"]
+    denom = yc * np.cos(p) - np.sin(p)
+    if denom <= 1e-4:                       # rayon vers l'horizon / le ciel
+        return None
+    Z = calib["h_cam"] * (yc * np.sin(p) + np.cos(p)) / denom
+    X = calib["h_cam"] * xc / denom
+    return (X, Z)
+
+
+def draw_minimap(frame, calib, vrus, left_tr, right_tr, frame_idx):
+    """Fenêtre vue de dessus en haut à droite.
+
+    - Curbs gauche/droite projetés au sol via la calibration.
+    - Piétons placés par distance (modèle joblib) et azimut latéral
+      (calculé depuis le centre cx de la box et la focale).
+    - Marqueur ego (trottinette), anneaux de distance et cône de champ.
+    """
+    if calib is None:
+        return
+    H, W = frame.shape[:2]
+    x0 = W - MINIMAP_MARGIN - MINIMAP_W
+    y0 = MINIMAP_MARGIN
+    if x0 < 0 or y0 + MINIMAP_H > H:        # frame trop petite : on s'abstient
+        return
+
+    # Fond semi-transparent + cadre + bandeau titre
+    sub = frame[y0:y0 + MINIMAP_H, x0:x0 + MINIMAP_W]
+    cv2.addWeighted(np.zeros_like(sub), 0.55, sub, 0.45, 0, sub)
+    cv2.rectangle(frame, (x0, y0), (x0 + MINIMAP_W, y0 + MINIMAP_H),
+                  (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (x0, y0), (x0 + MINIMAP_W, y0 + 20), (60, 60, 60), -1)
+    cv2.putText(frame, "BIRD-EYE VIEW", (x0 + 8, y0 + 15),
+                FONT, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Repère écran : ego en bas-centre, Z (profondeur) vers le haut
+    map_cx = x0 + MINIMAP_W // 2
+    ego_y  = y0 + MINIMAP_H - 16
+    top_y  = y0 + 30
+    sz = (ego_y - top_y) / MINIMAP_RANGE_M               # px / m (profondeur)
+    sx = (MINIMAP_W / 2 - 10) / MINIMAP_HALFWIDTH_M      # px / m (latéral)
+
+    def w2m(X, Z):
+        return (int(round(map_cx + X * sx)), int(round(ego_y - Z * sz)))
+
+    # Anneaux de distance + étiquettes
+    for r in MINIMAP_RINGS_M:
+        if r > MINIMAP_RANGE_M:
+            continue
+        ry = int(round(ego_y - r * sz))
+        cv2.line(frame, (x0 + 2, ry), (x0 + MINIMAP_W - 2, ry),
+                 (70, 70, 70), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{int(r)}m", (x0 + 4, ry - 3),
+                    FONT, 0.32, (130, 130, 130), 1, cv2.LINE_AA)
+    cv2.line(frame, (map_cx, top_y), (map_cx, ego_y),
+             (70, 70, 70), 1, cv2.LINE_AA)               # axe central
+
+    # Cône de champ de vision (HFOV déduit de la focale)
+    hfov = 2.0 * np.arctan(W / (2.0 * calib["f"]))
+    for s in (-1, 1):
+        fx = MINIMAP_RANGE_M * np.tan(s * hfov / 2.0)
+        cv2.line(frame, (map_cx, ego_y), w2m(fx, MINIMAP_RANGE_M),
+                 (90, 90, 110), 1, cv2.LINE_AA)
+
+    # Curbs projetés au sol (mêmes couleurs que l'overlay caméra)
+    for tr, color in ((left_tr, COLOR_LEFT), (right_tr, COLOR_RIGHT)):
+        if tr is None:
+            continue
+        curve = tr.at(frame_idx)
+        if curve is None:
+            continue
+        pts = []
+        for u, v in curve:
+            g = ground_point(float(u), float(v), calib)
+            if g is None:
+                continue
+            X, Z = g
+            if not (0.0 < Z <= MINIMAP_RANGE_M):
+                continue
+            px, py = w2m(X, Z)
+            px = min(max(px, x0 + 2), x0 + MINIMAP_W - 2)
+            pts.append((px, py))
+        if len(pts) >= 2:
+            cv2.polylines(frame, [np.array(pts, np.int32)], False,
+                          color, 2, cv2.LINE_AA)
+
+    # Piétons : rayon = distance (modèle), azimut = centre cx de la box
+    for (bx1, by1, bx2, by2, meta, dist) in vrus:
+        if dist is None:
+            continue
+        bcx   = (bx1 + bx2) / 2.0
+        theta = np.arctan2(bcx - calib["cx"], calib["f"])   # + = vers la droite
+        X = dist * np.sin(theta)
+        Z = min(dist * np.cos(theta), MINIMAP_RANGE_M)
+        px, py = w2m(X, Z)
+        px = min(max(px, x0 + 4), x0 + MINIMAP_W - 4)
+        py = min(max(py, top_y),  ego_y)
+        color = COLORS.get(meta["vtype"].lower(), DEFAULT_COLOR)
+        cv2.circle(frame, (px, py), 5, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, (px, py), 5, BLACK, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{dist:.0f}m", (px + 7, py + 4),
+                    FONT, 0.34, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Marqueur ego (trottinette) — triangle pointant vers l'avant
+    tri = np.array([(map_cx, ego_y - 11), (map_cx - 8, ego_y + 6),
+                    (map_cx + 8, ego_y + 6)], np.int32)
+    cv2.fillPoly(frame, [tri], (0, 200, 255), lineType=cv2.LINE_AA)
+    cv2.polylines(frame, [tri], True, BLACK, 1, cv2.LINE_AA)
+
+
 def draw_obstacle_banner(frame, zone_id):
     h, w = frame.shape[:2]
     text = f"OBSTACLE [{zone_id}]"
@@ -523,6 +739,7 @@ def process_clip(clip_name):
     enc_csv     = f"{CODEBOOK}/{clip_name}{ENC_SUFFIX}"
     obs_csv     = f"{CODEBOOK}/{clip_name}{OBS_SUFFIX}"
     speed_csv   = f"{ESCOOTER_DIR}/{clip_name}{SPEED_SUFFIX}"
+    lanes_csv   = f"{LANES_DIR}/{clip_name}{LANES_SUFFIX}"
     video_out   = f"{OUT_DIR}/{clip_name}{OUT_SUFFIX}"
 
     missing = [p for p in (video_in, autodet_csv, enc_csv) if not os.path.exists(p)]
@@ -558,9 +775,18 @@ def process_clip(clip_name):
     choices_by_frame = compute_steering_choices_per_second(gyrz_by_frame, fps)
     n_left, n_right  = count_steering_maneuvers(choices_by_frame)
 
+    # Curb tracks (seulement si le CSV corrected_lanes existe pour ce clip)
+    left_curb, right_curb = build_curb_tracks(lanes_csv, height, width)
+    curb_status = "on" if (left_curb is not None or right_curb is not None) else "off"
+
+    # Calibration caméra → mini-carte vue de dessus (bird-eye)
+    calib = load_calibration(f"{CODEBOOK}/{clip_name}{CALIB_SUFFIX}")
+    minimap_status = "on" if calib is not None else "off"
+
     print(f"[RUN ] {clip_name}  {width}×{height} @ {fps:.1f}fps  {total}f  "
           f"bbox={n_boxes}  obs_zones={len(obstacles)}  "
-          f"speed_pts={len(speed_by_frame)}  steer L/R={n_left}/{n_right}")
+          f"speed_pts={len(speed_by_frame)}  steer L/R={n_left}/{n_right}  "
+          f"curb={curb_status}  minimap={minimap_status}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out    = cv2.VideoWriter(video_out, fourcc, fps, (width, height))
@@ -570,8 +796,16 @@ def process_clip(clip_name):
         ret, frame = cap.read()
         if not ret:
             break
-        for (x1, y1, x2, y2, meta, dist) in vrus_by_frame.get(frame_idx, []):
+        # Curbs en premier : blend transparent sur la frame brute, ensuite
+        # les autres annotations (bbox, bandeau, camembert…) sont dessinées
+        # par-dessus, donc à pleine opacité.
+        frame = draw_curbs(frame, frame_idx, left_curb, right_curb)
+        frame_vrus = vrus_by_frame.get(frame_idx, [])
+        for (x1, y1, x2, y2, meta, dist) in frame_vrus:
             draw_box(frame, x1, y1, x2, y2, meta, dist)
+        # Mini-carte vue de dessus (avant le bandeau obstacle, qui reste
+        # prioritaire à l'affichage en cas de chevauchement au coin droit).
+        draw_minimap(frame, calib, frame_vrus, left_curb, right_curb, frame_idx)
         zid = obstacle_id_at(frame_idx, obstacles)
         if zid is not None:
             draw_obstacle_banner(frame, zid)
