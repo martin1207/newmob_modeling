@@ -27,8 +27,8 @@ CODEBOOK      = f"{ROOT}/codebookescooter"
 OUT_DIR       = f"{ROOT}/e_scooter_video_annotated"
 LANES_DIR     = f"{ROOT}/lanes"
 
-ENC_SUFFIX     = "_rater1_encounters_debug_encounters.csv"
-OBS_SUFFIX     = "_rater1_encounters_obstacle_zones.csv"
+ENC_SUFFIX     = "_rater2_encounters_debug_encounters.csv"
+OBS_SUFFIX     = "_rater2_encounters_obstacle_zones.csv"
 AUTODET_SUFFIX = "_debug_autodetect.csv"
 SPEED_SUFFIX   = "_corrected_with_offset.csv"   # IMU + GPS dans <ESCOOTER_DIR>
 VIDEO_SUFFIX   = "_canny.mp4"             # vidéo source (filtre Canny)
@@ -51,10 +51,18 @@ OVERWRITE = False   # True pour recalculer même si l'output existe déjà
 
 # ── Camembert de direction (choix par seconde, basé sur Δyaw = ∫GyrZ dt) ────
 STEERING_PIE_WINDOW_S      = 1.0   # fenêtre d'évaluation du choix de direction (s)
-STEERING_PIE_THRESHOLD_DEG = 10.0  # |Δyaw| sur la fenêtre < seuil ⇒ "tout droit"
+STEERING_PIE_THRESHOLD_DEG = 6.0  # |Δyaw| sur la fenêtre < seuil ⇒ "tout droit"
                                    # sinon : 'gauche' si Δyaw > 0, sinon 'droite'
 GYRZ_LEFT_POSITIVE         = True  # convention : True si GyrZ > 0 ⇒ virage à gauche
                                    # (à inverser si l'overlay annote l'inverse)
+
+# ── Freinage (déclenchement par seconde, basé sur le ratio v(t+1)/v(t)) ─────
+# Approche RELATIVE : on compare la vitesse moyenne d'une fenêtre à celle de
+# la fenêtre suivante. Identique à `escooter_biogeme_avoidance.ipynb`.
+BRAKE_WINDOW_S       = 1.0    # fenêtre d'évaluation (s)
+BRAKE_RATIO_LOW      = 0.95   # ratio < seuil ⇒ 'brake' (chute > 5%)
+ACCEL_RATIO_HIGH     = 1.05   # ratio > seuil ⇒ 'accel' (montée > 5%)
+BRAKE_SPEED_MIN_KMH  = 2.0    # sous ce v(t), on neutralise (bruit GPS)
 
 # ── Modèle de distance (bbox → mètres) ───────────────────────────────────────
 DISTANCE_MODEL_PATH = (
@@ -325,6 +333,80 @@ def count_steering_maneuvers(choices_by_frame):
     return n_left, n_right
 
 
+def compute_brake_choices_per_second(speed_by_frame, fps,
+                                     window_s=BRAKE_WINDOW_S,
+                                     ratio_low=BRAKE_RATIO_LOW,
+                                     ratio_high=ACCEL_RATIO_HIGH,
+                                     vmin_kmh=BRAKE_SPEED_MIN_KMH):
+    """{frame: (label, ratio)} — choix de freinage par fenêtre de `window_s`.
+
+    On découpe le signal de vitesse en fenêtres consécutives de `window_s` s,
+    et on compare la vitesse moyenne d'une fenêtre à celle de la suivante :
+        ratio = v(window_{t+1}) / v(window_t)
+      • ratio < `ratio_low`  → 'brake'   (chute > 5% par défaut)
+      • ratio > `ratio_high` → 'accel'   (montée > 5%)
+      • sinon                → 'cruise'
+
+    Si v(window_t) < `vmin_kmh` (≈ à l'arrêt, où le bruit GPS domine), la
+    fenêtre est forcée à 'cruise' avec ratio = 1.0.
+    """
+    if not speed_by_frame:
+        return {}
+    frames = sorted(speed_by_frame)
+    fmin, fmax = frames[0], frames[-1]
+    n = fmax - fmin + 1
+    arr = np.full(n, np.nan)
+    for fr, v in speed_by_frame.items():
+        arr[fr - fmin] = v
+    if np.isnan(arr).any():
+        idx = np.arange(n)
+        ok  = ~np.isnan(arr)
+        if ok.sum() >= 2:
+            arr = np.interp(idx, idx[ok], arr[ok])
+        else:
+            arr = np.nan_to_num(arr)
+
+    frames_per_window = max(1, int(round(window_s * fps)))
+    # Vitesse moyenne de chaque fenêtre
+    window_means = []
+    window_ranges = []
+    for i0 in range(0, n, frames_per_window):
+        i1 = min(i0 + frames_per_window, n)
+        window_means.append(float(np.mean(arr[i0:i1])))
+        window_ranges.append((i0, i1))
+
+    choices = {}
+    for w, (i0, i1) in enumerate(window_ranges):
+        v_t = window_means[w]
+        v_next = window_means[w + 1] if w + 1 < len(window_means) else v_t
+        if v_t < vmin_kmh:
+            label, ratio = 'cruise', 1.0
+        else:
+            ratio = v_next / v_t
+            if ratio < ratio_low:
+                label = 'brake'
+            elif ratio > ratio_high:
+                label = 'accel'
+            else:
+                label = 'cruise'
+        for i in range(i0, i1):
+            choices[fmin + i] = (label, ratio)
+    return choices
+
+
+def count_brake_events(choices_by_frame):
+    """(n_brake, n_accel) — nombre de fenêtres distinctes classées 'brake' / 'accel'."""
+    n_brake = n_accel = 0
+    last_label = None
+    for fr in sorted(choices_by_frame):
+        label = choices_by_frame[fr][0]
+        if label != last_label:
+            if   label == 'brake': n_brake += 1
+            elif label == 'accel': n_accel += 1
+        last_label = label
+    return n_brake, n_accel
+
+
 def build_curb_tracks(lanes_csv, H, W,
                       degree=CURB_DEGREE, min_size=CURB_MIN_SIZE,
                       smooth_win=CURB_SMOOTH_WIN):
@@ -483,6 +565,42 @@ def draw_speed(frame, speed_kmh):
     x, y = 20, 80 + th
     cv2.rectangle(frame, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), BLACK, -1)
     cv2.putText(frame, text, (x, y), FONT, scale, (0, 220, 0), thick, cv2.LINE_AA)
+
+
+# Couleurs BGR du badge de freinage
+BRAKE_BADGE_COLORS = {
+    'brake':  ( 80,  80, 255),   # rouge
+    'cruise': (180, 180, 180),   # gris clair
+    'accel':  (  0, 220,   0),   # vert
+}
+
+
+def draw_brake_indicator(frame, choice):
+    """Badge de freinage juste sous la vitesse.
+
+    `choice` est soit None, soit (label, ratio) avec label ∈
+    {'brake','cruise','accel'} et ratio = v(t+1)/v(t) sur la fenêtre.
+    """
+    if choice is None:
+        return
+    label, ratio = choice
+    label_up = label.upper()
+    color    = BRAKE_BADGE_COLORS.get(label, (200, 200, 200))
+    # Sous-titre : pourcentage de variation
+    pct = (ratio - 1.0) * 100
+    sub = f"v(t+1)/v(t) = {ratio:.2f}  ({pct:+.0f}%)"
+    scale_a, scale_b, thick, pad = 0.7, 0.45, 2, 8
+    (tw_a, th_a), _ = cv2.getTextSize(label_up, FONT, scale_a, thick)
+    (tw_b, th_b), _ = cv2.getTextSize(sub, FONT, scale_b, 1)
+    tw = max(tw_a, tw_b)
+    x  = 20
+    y1 = 80 + 30 + th_a + pad           # juste sous draw_speed
+    y2 = y1 + th_b + pad
+    cv2.rectangle(frame, (x - pad, y1 - th_a - pad),
+                  (x + tw + pad, y2 + pad), BLACK, -1)
+    cv2.putText(frame, label_up, (x, y1), FONT, scale_a, color, thick, cv2.LINE_AA)
+    cv2.putText(frame, sub,      (x, y2), FONT, scale_b,
+                (220, 220, 220), 1, cv2.LINE_AA)
 
 
 def draw_steering_pie(frame, choice):
@@ -775,6 +893,10 @@ def process_clip(clip_name):
     choices_by_frame = compute_steering_choices_per_second(gyrz_by_frame, fps)
     n_left, n_right  = count_steering_maneuvers(choices_by_frame)
 
+    # Déclenchement de freinage par fenêtre de 1 s à partir du ratio v(t+1)/v(t).
+    brake_choices_by_frame = compute_brake_choices_per_second(speed_by_frame, fps)
+    n_brake, n_accel       = count_brake_events(brake_choices_by_frame)
+
     # Curb tracks (seulement si le CSV corrected_lanes existe pour ce clip)
     left_curb, right_curb = build_curb_tracks(lanes_csv, height, width)
     curb_status = "on" if (left_curb is not None or right_curb is not None) else "off"
@@ -786,6 +908,7 @@ def process_clip(clip_name):
     print(f"[RUN ] {clip_name}  {width}×{height} @ {fps:.1f}fps  {total}f  "
           f"bbox={n_boxes}  obs_zones={len(obstacles)}  "
           f"speed_pts={len(speed_by_frame)}  steer L/R={n_left}/{n_right}  "
+          f"brake/accel={n_brake}/{n_accel}  "
           f"curb={curb_status}  minimap={minimap_status}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -815,6 +938,8 @@ def process_clip(clip_name):
         v = speed_by_frame.get(frame_idx)
         if v is not None:
             draw_speed(frame, v)
+        # Badge de freinage juste sous la vitesse
+        draw_brake_indicator(frame, brake_choices_by_frame.get(frame_idx))
         out.write(frame)
         frame_idx += 1
 

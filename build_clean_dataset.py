@@ -14,9 +14,16 @@ Source principale :
 
 Filtres appliqués :
   1. CONFIRM == 1 dans debug_encounters
-  2. Exclusion des frames en virage (|GyrZ| > TURN_THRESHOLD_DEG_S)
-  3. Exclusion des frames chevauchant des zones d'obstacle
-  4. Offset GPS de GPS_OFFSET_FRAMES frames
+  2. Exclusion des frames chevauchant des zones d'obstacle
+  3. Offset GPS de GPS_OFFSET_FRAMES frames
+
+Virages (turn_label) :
+  Les virages ne sont PLUS exclus via le GyrZ. Ils sont détectés à partir du
+  GPS (changement de direction des segments de route map-matchés / simplifiés)
+  et étiquetés dans la colonne `turn_label` :
+    none | before_left_turn | after_left_turn | before_right_turn | after_right_turn
+  Un virage = angle entre deux segments consécutifs > +80° (droite) ou < −80°
+  (gauche) ; les points à moins de 30 m (le long de la trace) sont étiquetés.
 
 Variables frame-level ajoutées depuis debug_encounters :
   - n_vru_total
@@ -189,9 +196,22 @@ def normalize_label(label: str) -> str:
 
 # ── 1. Paramètres ────────────────────────────────────────────────────────────
 GPS_OFFSET_FRAMES    = 60
-TURN_THRESHOLD_DEG_S = 20
+TURN_THRESHOLD_DEG_S = 20      # (déprécié) ancien seuil GyrZ d'exclusion des virages
 PERP_HALF_LENGTH     = 100
 DIRECTION_WINDOW     = 5
+
+# ── Détection des virages par le GPS (route map-matchée) ─────────────────────
+# Les virages ne sont plus EXCLUS via le GyrZ : ils sont LABELLISÉS à partir du
+# changement de direction de la trace GPS. On simplifie d'abord la trace
+# (Douglas-Peucker) pour obtenir des « segments de route » à l'échelle de la
+# rue, puis on mesure l'angle signé entre deux segments consécutifs :
+#   angle > +80°  → virage à droite     (rotation horaire)
+#   angle < -80°  → virage à gauche      (rotation anti-horaire)
+# Les points situés à moins de 30 m (le long de la trace) d'un virage sont
+# étiquetés before/after left/right turn.
+TURN_ANGLE_THRESHOLD_DEG = 80.0    # seuil d'angle entre segments consécutifs
+TURN_LABEL_RADIUS_M      = 30.0    # rayon (m, arc) autour d'un virage à étiqueter
+TURN_SIMPLIFY_TOL_M      = 8.0     # tolérance Douglas-Peucker (m) pour les segments
 # Framerate vidéo utilisé pour intégrer le yaw sur la fenêtre de steering.
 # Pas de vidéo ouverte ici → on reprend le fallback de correct_encounters.py
 # (cap.get(CAP_PROP_FPS) or 30.0).
@@ -207,7 +227,7 @@ TIME_SLOTS = [
 
 CODEBOOK_DIR         = '/Volumes/My Passport/NEWMOB/codebookescooter/'
 IMU_DIR              = '/Volumes/My Passport/NEWMOB/escooter/'
-ROAD_GPKG            = '/Volumes/My Passport/NEWMOB/road.gpkg'
+ROAD_GPKG            = '/Volumes/My Passport/NEWMOB/road_with_slope.geojson'
 PARTICIPANTS_XLS     = '/Volumes/My Passport/NEWMOB/participants_NewMob_Electromob_VAE_TE.xlsx'
 OUTPUT_FILE          = '/Volumes/My Passport/NEWMOB/clean_dataset.csv'
 DETECTIONS_FILE      = '/Volumes/My Passport/NEWMOB/clean_dataset_vru_detections.csv'
@@ -1147,23 +1167,33 @@ print(f"  {len(road_m)} polygones — CRS : {road_m.crs}\n")
 
 
 def find_polygon_for_point(point, road_gdf, sindex):
-    """Retourne (geometry, env_type) du polygone le plus proche du point."""
+    """Retourne (geometry, attrs) du polygone le plus proche du point.
+
+    attrs : dict avec 'env_type', 'slope_pct_max', 'slope_grad_x_pct',
+            'slope_grad_y_pct', 'elev_mean_m' (issu de road_with_slope.geojson
+            — NaN si la colonne n'existe pas).
+    """
     candidate_idx = list(sindex.intersection(point.bounds))
     candidates = road_gdf.iloc[candidate_idx]
 
     containing = candidates[candidates.contains(point)]
     if len(containing) > 0:
         row = containing.iloc[0]
-        return row.geometry, row.get("type", np.nan)
-
-    if len(candidates) > 0:
+    elif len(candidates) > 0:
         distances = candidates.geometry.distance(point)
         row = candidates.loc[distances.idxmin()]
-        return row.geometry, row.get("type", np.nan)
+    else:
+        distances = road_gdf.geometry.distance(point)
+        row = road_gdf.loc[distances.idxmin()]
 
-    distances = road_gdf.geometry.distance(point)
-    row = road_gdf.loc[distances.idxmin()]
-    return row.geometry, row.get("type", np.nan)
+    attrs = {
+        "env_type":         row.get("type",              np.nan),
+        "slope_pct_max":    row.get("slope_pct_max",     np.nan),
+        "slope_grad_x_pct": row.get("slope_grad_x_pct",  np.nan),
+        "slope_grad_y_pct": row.get("slope_grad_y_pct",  np.nan),
+        "elev_mean_m":      row.get("elev_mean_m",       np.nan),
+    }
+    return row.geometry, attrs
 
 
 def polygon_width_at_point(point, polygon, dx, dy, half_length=PERP_HALF_LENGTH):
@@ -1178,6 +1208,89 @@ def polygon_width_at_point(point, polygon, dx, dy, half_length=PERP_HALF_LENGTH)
     inter = perp.intersection(polygon)
 
     return np.nan if inter.is_empty else inter.length
+
+
+def compute_turn_labels(
+    xs,
+    ys,
+    angle_threshold_deg=TURN_ANGLE_THRESHOLD_DEG,
+    radius_m=TURN_LABEL_RADIUS_M,
+    simplify_tol_m=TURN_SIMPLIFY_TOL_M,
+):
+    """Étiquette les points GPS situés à proximité d'un virage.
+
+    Méthodologie (à partir du GPS, pas du GyrZ) :
+      1. La trace (coords projetées, en m, ordonnées le long du trajet) est
+         simplifiée par Douglas-Peucker → « segments de route » à l'échelle de
+         la rue, qui approchent la route map-matchée.
+      2. À chaque sommet intérieur, on mesure l'angle signé entre le segment
+         entrant et le segment sortant, exprimé en degrés de courbure dans
+         [-180°, 180°] (cap boussole : positif = rotation horaire) :
+             angle > +angle_threshold  → virage à DROITE
+             angle < -angle_threshold  → virage à GAUCHE
+      3. Les points situés à moins de `radius_m` (distance le long de la trace)
+         d'un virage sont étiquetés before/after left/right turn.
+
+    Renvoie une liste de labels (un par point) parmi :
+      'none', 'before_left_turn', 'after_left_turn',
+      'before_right_turn', 'after_right_turn'.
+    Si plusieurs virages se chevauchent, le virage le plus proche l'emporte.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    n = len(xs)
+    labels = ['none'] * n
+    if n < 3:
+        return labels
+
+    # Abscisse curviligne cumulée (m) le long de la trace brute.
+    seg_len = np.hypot(np.diff(xs), np.diff(ys))
+    arc = np.concatenate([[0.0], np.cumsum(seg_len)])
+
+    # Simplification → sommets significatifs (sous-ensemble des points d'origine).
+    simp = LineString(np.column_stack([xs, ys])).simplify(simplify_tol_m)
+    sc = np.asarray(simp.coords, dtype=float)
+    if len(sc) < 3:
+        return labels
+
+    # Index du point d'origine le plus proche de chaque sommet simplifié.
+    def _nearest_orig(px, py):
+        return int(np.argmin((xs - px) ** 2 + (ys - py) ** 2))
+
+    # Pour chaque virage retenu : (index d'origine, abscisse, signe droite/gauche).
+    turns = []
+    for j in range(1, len(sc) - 1):
+        vin_x, vin_y = sc[j] - sc[j - 1]
+        vout_x, vout_y = sc[j + 1] - sc[j]
+        if (vin_x == 0 and vin_y == 0) or (vout_x == 0 and vout_y == 0):
+            continue
+        # Cap boussole atan2(est, nord) : tourner à droite augmente le cap.
+        bearing_in = math.degrees(math.atan2(vin_x, vin_y))
+        bearing_out = math.degrees(math.atan2(vout_x, vout_y))
+        deflection = (bearing_out - bearing_in + 180.0) % 360.0 - 180.0
+        if deflection > angle_threshold_deg:
+            side = 'right'
+        elif deflection < -angle_threshold_deg:
+            side = 'left'
+        else:
+            continue
+        idx = _nearest_orig(sc[j][0], sc[j][1])
+        turns.append((idx, arc[idx], side))
+
+    if not turns:
+        return labels
+
+    # Affecter chaque point au virage le plus proche (en abscisse) dans le rayon.
+    best_dist = np.full(n, np.inf)
+    for idx, s_turn, side in turns:
+        d = np.abs(arc - s_turn)
+        within = (d <= radius_m) & (d < best_dist)
+        for i in np.nonzero(within)[0]:
+            phase = 'before' if arc[i] < s_turn else 'after'
+            labels[i] = f'{phase}_{side}_turn'
+            best_dist[i] = d[i]
+
+    return labels
 
 
 all_enc_files = glob.glob(os.path.join(CODEBOOK_DIR, '*_encounters_debug_encounters*.csv'))
@@ -1291,22 +1404,37 @@ for src, group in gdf.groupby("source"):
     widths = []
     print(f"  Calcul largeur : {src[-40:]}  ({len(group)} points)")
 
-    env_types = []
+    env_types          = []
+    slope_signed_pcts  = []   # pente signée selon le sens du trajet (%)
+    slope_max_pcts     = []   # pente max du polygone (% — absolue, sans signe)
+    elev_means         = []   # altitude moyenne du polygone (m)
     for i in range(len(group)):
-        point              = group.geometry.iloc[i]
-        polygon, env_type  = find_polygon_for_point(point, road_m, sindex)
-        env_types.append(env_type)
+        point          = group.geometry.iloc[i]
+        polygon, attrs = find_polygon_for_point(point, road_m, sindex)
+        env_types.append(attrs["env_type"])
+        slope_max_pcts.append(attrs["slope_pct_max"])
+        elev_means.append(attrs["elev_mean_m"])
 
         i_prev = max(0, i - DIRECTION_WINDOW)
         i_next = min(len(group) - 1, i + DIRECTION_WINDOW)
 
         if i_prev == i_next:
             widths.append(np.nan)
+            slope_signed_pcts.append(np.nan)
             continue
 
         dx = group.geometry.iloc[i_next].x - group.geometry.iloc[i_prev].x
         dy = group.geometry.iloc[i_next].y - group.geometry.iloc[i_prev].y
         widths.append(polygon_width_at_point(point, polygon, dx, dy))
+
+        # Pente signée : projection du gradient (% par m) sur le vecteur
+        # unitaire de déplacement → positif = montée dans le sens de circulation.
+        norm = math.hypot(dx, dy)
+        gx, gy = attrs["slope_grad_x_pct"], attrs["slope_grad_y_pct"]
+        if norm > 0 and pd.notna(gx) and pd.notna(gy):
+            slope_signed_pcts.append(gx * dx / norm + gy * dy / norm)
+        else:
+            slope_signed_pcts.append(np.nan)
 
     group = group.copy()
     group["road_width_perp_m"] = widths
@@ -1314,18 +1442,43 @@ for src, group in gdf.groupby("source"):
         method="linear", limit_direction="both"
     )
     group["environment_type"] = env_types
+    group["slope_signed_pct"] = slope_signed_pcts
+    group["slope_pct_max"]    = slope_max_pcts
+    group["elev_mean_m"]      = elev_means
+    group["slope_signed_pct"] = group["slope_signed_pct"].interpolate(
+        method="linear", limit_direction="both"
+    )
 
-    for _, row in group[["frame", "road_width_perp_m", "environment_type"]].iterrows():
+    # Label de virage à partir du GPS (cf. compute_turn_labels) : on n'exclut
+    # plus les virages, on les étiquette before/after left/right turn.
+    group["turn_label"] = compute_turn_labels(
+        group.geometry.x.to_numpy(), group.geometry.y.to_numpy()
+    )
+    n_turn_pts = int((group["turn_label"] != "none").sum())
+    print(f"     Virages GPS : {n_turn_pts} points étiquetés "
+          f"({sorted(set(group['turn_label']) - {'none'})})")
+
+    cols_keep_iter = ["frame", "road_width_perp_m", "environment_type",
+                      "slope_signed_pct", "slope_pct_max", "elev_mean_m",
+                      "turn_label"]
+    for _, row in group[cols_keep_iter].iterrows():
         road_width_records.append({
             "source":            src,
             "frame_imu_raw":     row["frame"],
             "road_width_perp_m": row["road_width_perp_m"],
             "environment_type":  row["environment_type"],
+            "slope_signed_pct":  row["slope_signed_pct"],
+            "slope_pct_max":     row["slope_pct_max"],
+            "elev_mean_m":       row["elev_mean_m"],
+            "turn_label":        row["turn_label"],
         })
 
 road_width_df = pd.DataFrame(road_width_records)
 road_width_df["frame"] = road_width_df["frame_imu_raw"] - GPS_OFFSET_FRAMES
-road_width_df = road_width_df[["source", "frame", "road_width_perp_m", "environment_type"]]
+road_width_df = road_width_df[[
+    "source", "frame", "road_width_perp_m", "environment_type",
+    "slope_signed_pct", "slope_pct_max", "elev_mean_m", "turn_label",
+]]
 
 print(f"\n  ✔  road_width_df : {len(road_width_df)} lignes\n")
 
@@ -1465,12 +1618,9 @@ for enc_path in sorted(encounter_files):
               f"(fenêtre {STEERING_PIE_WINDOW_S:.0f}s, "
               f"seuil {STEERING_PIE_THRESHOLD_DEG:.0f}°)")
 
-        valid_frames = set(
-            imu.loc[
-                imu["GyrZ(deg/s)"].isna() | (imu["GyrZ(deg/s)"].abs() <= TURN_THRESHOLD_DEG_S),
-                "frame_corrected",
-            ]
-        )
+        # Les virages ne sont plus exclus ici : ils sont étiquetés à partir du
+        # GPS (colonne turn_label, jointe via road_width_df). On conserve donc
+        # toutes les frames.
 
         # Frame-level construit à partir des VRAIES détections autodetect
         # (et non des intervalles d'encounters), comme overlay_annotations.py.
@@ -1488,7 +1638,6 @@ for enc_path in sorted(encounter_files):
         else:
             frame_df['at_intersection'] = 0
 
-        n0 = len(frame_df)
         if frame_df.empty:
             print("   ℹ  Aucune détection autodetect confirmée (frame_df vide)")
             continue
@@ -1498,11 +1647,7 @@ for enc_path in sorted(encounter_files):
         speed_map = imu.drop_duplicates("frame_corrected").set_index("frame_corrected")["VitGPS(km/h)"].to_dict()
         frame_df["speed_kmh_t1"] = frame_df["frame"].add(1).map(speed_map)
 
-        frame_df = frame_df[frame_df["frame"].isin(valid_frames)].copy()
-        # Mêmes filtres appliqués au DataFrame des détections (bbox-level)
-        if not det_df.empty:
-            det_df = det_df[det_df["frame"].isin(valid_frames)].copy()
-        print(f"   Virages   : {n0 - len(frame_df):>4} lignes retirées → {len(frame_df)} restantes")
+        # (Virages : plus d'exclusion — labellisés via turn_label depuis le GPS.)
 
         n1 = len(frame_df)
         if obs_intervals:
@@ -1595,6 +1740,10 @@ for enc_path in sorted(encounter_files):
     "at_intersection",
     # Environnement
     "environment_type",
+    # Pente / élévation (issues de road_with_slope.geojson)
+    "slope_signed_pct",     # signé : positif = montée dans le sens du trajet
+    "slope_pct_max",        # magnitude de pente du polygone (toujours >= 0)
+    "elev_mean_m",
 ]
         
         frame_df = frame_df[[c for c in keep if c in frame_df.columns]].copy()
@@ -1623,18 +1772,21 @@ else:
     # Jointure road_width
     dataset = dataset.merge(road_width_df, on=["source", "frame"], how="left")
 
+    # turn_label : 'none' par défaut (frames hors GPS ou non proches d'un virage)
+    if "turn_label" in dataset.columns:
+        dataset["turn_label"] = dataset["turn_label"].fillna("none")
+
     n_missing_rw = dataset["road_width_perp_m"].isna().sum()
     if n_missing_rw > 0:
         print(f"  ⚠  {n_missing_rw} lignes sans largeur de route — remplissage par valeur la plus proche (ffill/bfill)")
         dataset = dataset.sort_values(["source", "frame"])
-        dataset["road_width_perp_m"] = (
-            dataset.groupby("source")["road_width_perp_m"]
-            .transform(lambda s: s.ffill().bfill())
-        )
-        dataset["environment_type"] = (
-            dataset.groupby("source")["environment_type"]
-            .transform(lambda s: s.ffill().bfill())
-        )
+        for col in ["road_width_perp_m", "environment_type",
+                    "slope_signed_pct", "slope_pct_max", "elev_mean_m"]:
+            if col in dataset.columns:
+                dataset[col] = (
+                    dataset.groupby("source")[col]
+                    .transform(lambda s: s.ffill().bfill())
+                )
         n_still_missing = dataset["road_width_perp_m"].isna().sum()
         if n_still_missing > 0:
             print(f"  ⚠  {n_still_missing} lignes encore NaN (source entièrement sans GPS)")
