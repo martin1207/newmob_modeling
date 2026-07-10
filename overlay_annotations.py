@@ -15,11 +15,14 @@ Output :
 """
 
 import os
+import re
 import cv2
 import csv
 import glob
 
 import numpy as np
+
+import kalman_speed   # vitesse GPS Kalman partagée avec build_clean_dataset.py
 
 ROOT          = "/Volumes/My Passport/NEWMOB"
 ESCOOTER_DIR  = f"{ROOT}/escooter"
@@ -27,10 +30,15 @@ CODEBOOK      = f"{ROOT}/codebookescooter"
 OUT_DIR       = f"{ROOT}/e_scooter_video_annotated"
 LANES_DIR     = f"{ROOT}/lanes"
 
-ENC_SUFFIX     = "_rater2_encounters_debug_encounters.csv"
-OBS_SUFFIX     = "_rater2_encounters_obstacle_zones.csv"
+# Suffixes codebook : le numéro de rater est découvert dynamiquement
+# (cf. find_codebook_file), donc plus de _rater2 codé en dur — les clips
+# annotés par rater1 uniquement sont désormais pris en charge.
+ENC_KIND       = "debug_encounters"       # <clip>_rater<N>_encounters_debug_encounters.csv
+OBS_KIND       = "obstacle_zones"         # <clip>_rater<N>_encounters_obstacle_zones.csv
 AUTODET_SUFFIX = "_debug_autodetect.csv"
-SPEED_SUFFIX   = "_corrected_with_offset.csv"   # IMU + GPS dans <ESCOOTER_DIR>
+# IMU + GPS recalé (lag GPS estimé par clip déjà appliqué). La vitesse Kalman
+# est calculée à partir de Lat/Long (cf. load_speed_by_frame).
+SPEED_SUFFIX   = "_corrected_with_offset_gpsfixed.csv"
 VIDEO_SUFFIX   = "_canny.mp4"             # vidéo source (filtre Canny)
 OUT_SUFFIX     = "_annotated_codes.mp4"
 LANES_SUFFIX   = "_corrected_lanes.csv"         # courbes curb gauche/droite
@@ -65,14 +73,24 @@ ACCEL_RATIO_HIGH     = 1.05   # ratio > seuil ⇒ 'accel' (montée > 5%)
 BRAKE_SPEED_MIN_KMH  = 2.0    # sous ce v(t), on neutralise (bruit GPS)
 
 # ── Modèle de distance (bbox → mètres) ───────────────────────────────────────
+# Modèle LONGITUDINAL (distance le long de l'axe). Calibré 2026-07, entraîné
+# avec h SEUL (+ augmentation warp roll/pitch et bruit h) : h est naturellement
+# robuste au tilt caméra, contrairement à cy/bottom_y.
 DISTANCE_MODEL_PATH = (
     "/Users/martin.dejaeghere/PhD/NEWMOB-main/model/saved_models/"
-    "distance_model_20260506_093716.joblib"
+    "distance_model_long_h_latest.joblib"
+)
+# Modèle LATÉRAL (décalage latéral du VRU, m).
+LATERAL_MODEL_PATH = (
+    "/Users/martin.dejaeghere/PhD/NEWMOB-main/model/saved_models/"
+    "distance_model_lat_nw_latest.joblib"
 )
 # Ordre des features par défaut (cf. .meta.json) ; sera écrasé par la valeur
-# stockée dans le bundle joblib si présente.
+# stockée dans le bundle joblib si présente. Les bundles no-w n'utilisent que
+# cx, cy, h, bottom_y, inv_h — predict() ne lit que bundle["features"].
 DEFAULT_DISTANCE_FEATURES = ["cx", "cy", "w", "h", "bottom_y", "aspect", "area", "inv_h"]
 _distance_bundle = None  # cache : (estimator, features) ou False si échec
+_lateral_bundle = None   # cache modèle latéral
 
 
 def get_distance_model():
@@ -146,6 +164,46 @@ def predict_distances(bboxes):
         print(f"[WARN] Échec de prédiction de distance : {e}")
         return [None] * len(bboxes)
 
+
+def get_lateral_model():
+    """Charge le bundle joblib du modèle LATÉRAL une seule fois.
+    Renvoie (estimator, features) ou None si indisponible."""
+    global _lateral_bundle
+    if _lateral_bundle is None:
+        try:
+            import joblib
+            obj = joblib.load(LATERAL_MODEL_PATH)
+            if isinstance(obj, dict):
+                est = obj.get("model") or obj.get("estimator") or obj.get("pipeline")
+                feats = obj.get("features", DEFAULT_DISTANCE_FEATURES)
+            else:
+                est, feats = obj, DEFAULT_DISTANCE_FEATURES
+            if est is None or not hasattr(est, "predict"):
+                raise ValueError("Aucun estimator avec .predict dans le bundle latéral")
+            _lateral_bundle = (est, list(feats))
+            print(f"[INFO] Modèle latéral chargé : "
+                  f"{os.path.basename(LATERAL_MODEL_PATH)}  features={_lateral_bundle[1]}")
+        except Exception as e:
+            print(f"[WARN] Impossible de charger le modèle latéral "
+                  f"({LATERAL_MODEL_PATH}) : {e}")
+            _lateral_bundle = False
+    return _lateral_bundle if _lateral_bundle else None
+
+
+def predict_lateral(bboxes):
+    """bboxes = liste de (x1,y1,x2,y2) → liste de décalages latéraux (m) ou None."""
+    bundle = get_lateral_model()
+    if bundle is None or not bboxes:
+        return [None] * len(bboxes)
+    estimator, feature_names = bundle
+    try:
+        rows = [_bbox_feature_dict(*b) for b in bboxes]
+        X = np.array([[r[f] for f in feature_names] for r in rows], dtype=float)
+        return [float(v) for v in estimator.predict(X)]
+    except Exception as e:
+        print(f"[WARN] Échec de prédiction latérale : {e}")
+        return [None] * len(bboxes)
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ── Couleurs / police (constants partagés) ───────────────────────────────────
@@ -194,6 +252,24 @@ def _open_dictreader(path):
     return f, csv.DictReader(f, delimiter=delim)
 
 
+def find_codebook_file(clip_name, kind):
+    """Chemin du CSV codebook `<clip>_rater<N>_encounters_<kind>.csv`, QUEL QUE
+    SOIT le numéro de rater. En cas de plusieurs raters, on préfère le numéro le
+    plus élevé (rater2 > rater1), comme build_clean_dataset.py. Tolère aussi une
+    variante sans numéro de rater. Retourne '' si aucun fichier n'existe."""
+    cands = glob.glob(os.path.join(CODEBOOK, f"{clip_name}_rater*_encounters_{kind}.csv"))
+    cands += glob.glob(os.path.join(CODEBOOK, f"{clip_name}_encounters_{kind}.csv"))
+    cands = [p for p in cands if not os.path.basename(p).startswith("._")]
+    if not cands:
+        return ""
+
+    def _rater_num(p):
+        m = re.search(r"_rater(\d+)_", os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    return sorted(cands, key=_rater_num)[-1]
+
+
 def load_enc_meta(enc_csv):
     """{(track_id, frame): meta} pour les encounters CONFIRM == 1."""
     enc_meta = {}
@@ -223,21 +299,44 @@ def load_enc_meta(enc_csv):
     return enc_meta
 
 
+def _to_float(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def load_speed_by_frame(speed_csv):
-    """{frame: VitGPS(km/h)} ; ignore les lignes vides."""
+    """{frame: vitesse Kalman (km/h)} — vitesse GPS lissée (kalman_speed.gps_speed_kmh)
+    calculée à partir de Lat/Long, puis moyennée par frame vidéo.
+
+    C'est STRICTEMENT la même vitesse que la colonne speed_kmh_kalman du dataset
+    (build_clean_dataset.py) : la vitesse n'est stockée dans aucun CSV, elle est
+    recalculée ici depuis les positions GPS recalées du fichier gpsfixed.
+    """
     speed = {}
     if not os.path.exists(speed_csv):
         return speed
+    frames, ts, lat, lon = [], [], [], []
     f, reader = _open_dictreader(speed_csv)
     with f:
         for row in reader:
             try:
                 fr = int(float(row["frame"]))
-                v  = float(row["VitGPS(km/h)"])
-            except (ValueError, KeyError):
-                continue
-            speed[fr] = v
-    return speed
+                t  = float(row["TimeStamp"])
+            except (ValueError, KeyError, TypeError):
+                continue                       # ligne inexploitable (pas de frame/horodatage)
+            frames.append(fr); ts.append(t)
+            lat.append(_to_float(row.get("Lat")))
+            lon.append(_to_float(row.get("Long")))
+    if not frames:
+        return speed
+    v = kalman_speed.gps_speed_kmh(ts, lat, lon)     # km/h, aligné ligne à ligne (NaN si pas de GPS)
+    agg = {}
+    for fr, vi in zip(frames, v):
+        if np.isfinite(vi):
+            agg.setdefault(fr, []).append(vi)
+    return {fr: float(np.mean(vs)) for fr, vs in agg.items()}
 
 
 def load_gyrz_by_frame(speed_csv):
@@ -854,8 +953,8 @@ def draw_obstacle_banner(frame, zone_id):
 def process_clip(clip_name):
     video_in    = f"{ESCOOTER_DIR}/{clip_name}{VIDEO_SUFFIX}"
     autodet_csv = f"{CODEBOOK}/{clip_name}{AUTODET_SUFFIX}"
-    enc_csv     = f"{CODEBOOK}/{clip_name}{ENC_SUFFIX}"
-    obs_csv     = f"{CODEBOOK}/{clip_name}{OBS_SUFFIX}"
+    enc_csv     = find_codebook_file(clip_name, ENC_KIND)   # rater découvert dynamiquement
+    obs_csv     = find_codebook_file(clip_name, OBS_KIND)
     speed_csv   = f"{ESCOOTER_DIR}/{clip_name}{SPEED_SUFFIX}"
     lanes_csv   = f"{LANES_DIR}/{clip_name}{LANES_SUFFIX}"
     video_out   = f"{OUT_DIR}/{clip_name}{OUT_SUFFIX}"
@@ -949,14 +1048,25 @@ def process_clip(clip_name):
 
 
 def discover_clips():
-    """Clips ayant à la fois encounters + autodetect + vidéo Canny."""
-    enc_files = glob.glob(f"{CODEBOOK}/*{ENC_SUFFIX}")
-    clips = []
+    """Clips ayant à la fois encounters + autodetect + vidéo Canny.
+
+    Découverte indépendante du numéro de rater : on capture
+    `<clip>_rater<N>_encounters_debug_encounters.csv` pour tout N (et la variante
+    sans rater), puis on déduplique par nom de clip."""
+    enc_files = (
+        glob.glob(f"{CODEBOOK}/*_rater*_encounters_{ENC_KIND}.csv")
+        + glob.glob(f"{CODEBOOK}/*_encounters_{ENC_KIND}.csv")
+    )
+    clips = set()
     for p in enc_files:
-        name = os.path.basename(p)[: -len(ENC_SUFFIX)]
+        base = os.path.basename(p)
+        if base.startswith("._"):
+            continue
+        name = re.sub(rf"_rater\d+_encounters_{ENC_KIND}\.csv$", "", base)
+        name = re.sub(rf"_encounters_{ENC_KIND}\.csv$", "", name)
         if (os.path.exists(f"{CODEBOOK}/{name}{AUTODET_SUFFIX}")
                 and os.path.exists(f"{ESCOOTER_DIR}/{name}{VIDEO_SUFFIX}")):
-            clips.append(name)
+            clips.add(name)
     return sorted(clips)
 
 

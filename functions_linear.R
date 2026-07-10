@@ -636,7 +636,7 @@ PLOT_VAR_ORDER <- c(
 #   y = rhs + epsilon,  epsilon ~ N(0, sigma²)
 #
 # Arguments
-#   df_est     : data.frame avec au moins speed_kmh_t1 + les variables de rhs
+#   df_est     : data.frame avec au moins speed_kmh_kalman_t1 + les variables de rhs
 #   rhs        : partie droite de la formule, ex. "z_n_pedestrians + genre_female"
 #                Utilisez "1" pour le modèle nul (intercept seul).
 #   model_name : identifiant du modèle (ex. "M1_pedestrians")
@@ -647,9 +647,9 @@ run_linear <- function(df_est, rhs, model_name, ref = NULL) {
   # ref : résultat de run_linear(..., "1", "M0") pour comparer au même modèle
   #       constant global. Si NULL, un modèle constant est estimé localement.
 
-  formula_obj  <- as.formula(paste("speed_kmh_t1 ~", rhs))
+  formula_obj  <- as.formula(paste("speed_kmh_kalman_t1 ~", rhs))
 
-  vars_used <- unique(c("speed_kmh_t1", all.vars(formula_obj)))
+  vars_used <- unique(c("speed_kmh_kalman_t1", all.vars(formula_obj)))
   vars_used <- vars_used[vars_used %in% names(df_est)]
   data      <- df_est[, vars_used, drop = FALSE]
   for (cn in names(data)) {
@@ -672,7 +672,7 @@ run_linear <- function(df_est, rhs, model_name, ref = NULL) {
     ll_null <- ref$metrics$LL_final
     k_null  <- ref$metrics$K
   } else {
-    fit0    <- lm(speed_kmh_t1 ~ 1, data = data)
+    fit0    <- lm(speed_kmh_kalman_t1 ~ 1, data = data)
     ll_null <- as.numeric(logLik(fit0))
     k_null  <- 2   # mu + sigma
   }
@@ -770,10 +770,10 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
   # Construction des termes aléatoires : (1|col1) + (1|col2) + ...
   re_terms <- paste(sprintf("(1|%s)", panel_cols), collapse = " + ")
 
-  formula_obj  <- as.formula(paste0("speed_kmh_t1 ~ ", rhs, " + ", re_terms))
-  formula_null <- as.formula(paste0("speed_kmh_t1 ~ ", re_terms))
+  formula_obj  <- as.formula(paste0("speed_kmh_kalman_t1 ~ ", rhs, " + ", re_terms))
+  formula_null <- as.formula(paste0("speed_kmh_kalman_t1 ~ ", re_terms))
 
-  vars_used <- unique(c("speed_kmh_t1", panel_cols,
+  vars_used <- unique(c("speed_kmh_kalman_t1", panel_cols,
                          all.vars(as.formula(paste("~", rhs)))))
   vars_used <- vars_used[vars_used %in% names(df_est)]
   data      <- df_est[, vars_used, drop = FALSE]
@@ -810,7 +810,7 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
   k_null  <- attr(logLik(fit0_ml), "df")
 
   # Nul OLS pur (μ seul, sans RE) → ρ² comparable à run_linear
-  ll_null_ols <- as.numeric(logLik(lm(speed_kmh_t1 ~ 1, data = data)))
+  ll_null_ols <- as.numeric(logLik(lm(speed_kmh_kalman_t1 ~ 1, data = data)))
   k_null_ols  <- 2L   # μ + σ
 
   # ── Métriques ─────────────────────────────────────────────────────────────

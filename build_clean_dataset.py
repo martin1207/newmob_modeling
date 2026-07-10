@@ -15,7 +15,14 @@ Source principale :
 Filtres appliqués :
   1. CONFIRM == 1 dans debug_encounters
   2. Exclusion des frames chevauchant des zones d'obstacle
-  3. Offset GPS de GPS_OFFSET_FRAMES frames
+  3. (Plus d'offset GPS fixe : le décalage GPS est désormais estimé par clip
+     et déjà appliqué en amont dans *_corrected_with_offset_gpsfixed.csv.)
+
+Vitesse :
+  - speed_kmh        : VitGPS(km/h) du téléphone (sous-estime ~20 %)
+  - speed_kmh_kalman : vitesse GPS lissée par filtre de Kalman position
+    (CV 2D) + lisseur RTS, cf. speed/compare_speed_scooter_gps.ipynb §2
+    (référence validée contre le compteur du scooter, r≈0.86)
 
 Virages (turn_label) :
   Les virages ne sont PLUS exclus via le GyrZ. Ils sont détectés à partir du
@@ -62,12 +69,18 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in _sys.path:
     _sys.path.insert(0, _THIS_DIR)
 try:
-    # predict_distances(bboxes) -> liste de distances (m) ou None.
-    # Charge le modèle joblib paresseusement (cf. overlay_annotations.py).
+    # predict_distances(bboxes) -> distances longitudinales (m) ou None.
+    # predict_lateral(bboxes)   -> décalages latéraux (m) ou None.
+    # Chargent les modèles joblib paresseusement (cf. overlay_annotations.py).
     from overlay_annotations import predict_distances as _oa_predict_distances
+    try:
+        from overlay_annotations import predict_lateral as _oa_predict_lateral
+    except Exception:
+        _oa_predict_lateral = None  # ancien overlay_annotations sans modèle latéral
 except Exception as _e:
     print(f"⚠  overlay_annotations indisponible ({_e}) — distances non prédites")
     _oa_predict_distances = None
+    _oa_predict_lateral = None
 
 try:
     # Choix de direction par fenêtre de 1 s (Δyaw = ∫GyrZ dt), mêmes
@@ -195,7 +208,11 @@ def normalize_label(label: str) -> str:
 
 
 # ── 1. Paramètres ────────────────────────────────────────────────────────────
-GPS_OFFSET_FRAMES    = 60
+# Le décalage GPS→vidéo était auparavant corrigé par un offset fixe de 60 frames
+# (≈2 s à 30 fps). Il est désormais estimé PAR CLIP (gps_lag_applied_s) et déjà
+# appliqué aux colonnes Lat/Long/VitGPS des fichiers *_corrected_with_offset_
+# gpsfixed.csv. On n'applique donc plus aucun offset ici (0 = pas de décalage).
+GPS_OFFSET_FRAMES    = 0
 TURN_THRESHOLD_DEG_S = 20      # (déprécié) ancien seuil GyrZ d'exclusion des virages
 PERP_HALF_LENGTH     = 100
 DIRECTION_WINDOW     = 5
@@ -232,6 +249,43 @@ PARTICIPANTS_XLS     = '/Volumes/My Passport/NEWMOB/participants_NewMob_Electrom
 OUTPUT_FILE          = '/Volumes/My Passport/NEWMOB/clean_dataset.csv'
 DETECTIONS_FILE      = '/Volumes/My Passport/NEWMOB/clean_dataset_vru_detections.csv'
 INTERSECTIONS_CSV    = '/Volumes/My Passport/NEWMOB/clips_intersections/recap_intersections.csv'
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPERS — Sélection du fichier IMU
+# ═════════════════════════════════════════════════════════════════════════════
+
+def find_imu_candidates(prefix):
+    """Fichiers IMU du trajet, en PRÉFÉRANT la variante GPS-recalée
+    (*_corrected_with_offset_gpsfixed.csv : lag GPS estimé par clip déjà
+    appliqué aux colonnes Lat/Long/VitGPS), puis *_corrected_with_offset.csv,
+    puis n'importe quel CSV du trajet."""
+    return (
+        glob.glob(os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset_gpsfixed*.csv'))
+        or glob.glob(os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset*.csv'))
+        or glob.glob(os.path.join(IMU_DIR, f'{prefix}*.csv'))
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPERS — Vitesse GPS par filtre de Kalman (position CV 2D + lisseur RTS)
+# Implémentation partagée dans kalman_speed.py (numpy pur), pour que la vitesse
+# du dataset soit STRICTEMENT identique à celle affichée sur les vidéos par
+# overlay_annotations.py. Réf. validée contre le compteur (r≈0.86 ; VitGPS
+# sous-estime ~20 %). N'utilise que Lat/Long.
+# ═════════════════════════════════════════════════════════════════════════════
+import kalman_speed
+
+
+def kalman_gps_speed_kmh(imu, q=2.0, r=9.0):
+    """Vitesse GPS Kalman (km/h) alignée sur l'index de `imu`. NaN là où le
+    trajet n'a pas de position GPS valide. Voir kalman_speed.gps_speed_kmh."""
+    if not {"TimeStamp", "Lat", "Long"}.issubset(imu.columns):
+        return pd.Series(np.nan, index=imu.index, dtype=float)
+    v = kalman_speed.gps_speed_kmh(
+        imu["TimeStamp"].values, imu["Lat"].values, imu["Long"].values, q=q, r=r
+    )
+    return pd.Series(v, index=imu.index, dtype=float)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -534,7 +588,7 @@ def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
     """
     cols = [
         'frame', 'track_id', 'x1', 'y1', 'x2', 'y2',
-        'foot_x', 'foot_y', 'bbox_height', 'distance_m',
+        'foot_x', 'foot_y', 'bbox_height', 'distance_m', 'lateral_m',
         'cx_px', 'azimuth_deg',
         'VRU_TYPE_LABEL', 'INTERACTION_LABEL',
         'VRU_AGE_GROUP_LABEL', 'VRU_GAIT_LABEL', 'VRU_GROUP_SIZE_LABEL',
@@ -592,6 +646,16 @@ def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
         distances = [None] * len(bboxes)
 
     df['distance_m']           = distances
+
+    # Décalage latéral (m) — second modèle bbox→mètres (n'utilise pas w)
+    if _oa_predict_lateral is not None and bboxes:
+        try:
+            df['lateral_m'] = _oa_predict_lateral(bboxes)
+        except Exception as e:
+            print(f"   ⚠  Échec predict_lateral : {e}")
+            df['lateral_m'] = [None] * len(bboxes)
+    else:
+        df['lateral_m'] = [None] * len(bboxes)
 
     # Azimut horizontal (deg) — modèle sténopé, point principal = centre image
     df['cx_px']       = (df['x1'] + df['x2']) / 2.0
@@ -1330,14 +1394,10 @@ for enc_path in sorted(encounter_files):
         continue
     seen_prefixes.add(prefix)
 
-    imu_candidates = (
-        glob.glob(os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset*.csv'))
-        or glob.glob(os.path.join(IMU_DIR, f'{prefix}*.csv'))
-    )
+    imu_candidates = find_imu_candidates(prefix)
     if not imu_candidates:
         print(f"⚠ Aucun IMU trouvé pour prefix = {prefix}")
-        print(f"   Pattern 1: {os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset*.csv')}")
-        print(f"   Pattern 2: {os.path.join(IMU_DIR, f'{prefix}*.csv')}")
+        print(f"   Recherché : {os.path.join(IMU_DIR, f'{prefix}*_corrected_with_offset_gpsfixed.csv')} (et variantes)")
         continue
 
     try:
@@ -1535,10 +1595,7 @@ for enc_path in sorted(encounter_files):
         continue
     seen_prefixes.add(prefix)
 
-    imu_candidates = (
-        glob.glob(os.path.join(IMU_DIR, f'{prefix}*corrected_with_offset*.csv'))
-        or glob.glob(os.path.join(IMU_DIR, f'{prefix}*.csv'))
-    )
+    imu_candidates = find_imu_candidates(prefix)
     if not imu_candidates:
         print(f"⚠  [{prefix}] Pas de fichier IMU — trajet ignoré")
         continue
@@ -1587,6 +1644,15 @@ for enc_path in sorted(encounter_files):
         n_interpolated = n_nan_speed - imu["VitGPS(km/h)"].isna().sum()
         if n_nan_speed > 0:
             print(f"   VitGPS NaN : {n_nan_speed} → {n_interpolated} interpolées")
+
+        # Vitesse GPS lissée par Kalman position + RTS (cf. speed/§2), calculée
+        # sur les fixes GPS du clip puis interpolée par ligne IMU. Se joint
+        # ensuite comme speed_kmh (colonne speed_kmh_kalman).
+        imu["speed_kmh_kalman"] = kalman_gps_speed_kmh(imu)
+        n_kal_ok = int(imu["speed_kmh_kalman"].notna().sum())
+        print(f"   Kalman GPS : {n_kal_ok}/{len(imu)} lignes avec vitesse "
+              f"(moy {imu['speed_kmh_kalman'].mean():.1f} km/h)"
+              if n_kal_ok else "   Kalman GPS : aucune position exploitable")
 
         imu["frame_corrected"] = imu["frame"] - GPS_OFFSET_FRAMES
 
@@ -1646,6 +1712,8 @@ for enc_path in sorted(encounter_files):
         # Calculé avant filtrage pour conserver la valeur même si t+1 est filtré.
         speed_map = imu.drop_duplicates("frame_corrected").set_index("frame_corrected")["VitGPS(km/h)"].to_dict()
         frame_df["speed_kmh_t1"] = frame_df["frame"].add(1).map(speed_map)
+        kalman_map = imu.drop_duplicates("frame_corrected").set_index("frame_corrected")["speed_kmh_kalman"].to_dict()
+        frame_df["speed_kmh_kalman_t1"] = frame_df["frame"].add(1).map(kalman_map)
 
         # (Virages : plus d'exclusion — labellisés via turn_label depuis le GPS.)
 
@@ -1672,10 +1740,11 @@ for enc_path in sorted(encounter_files):
         # dans la même source après concaténation).
         last_frame = frame_df["frame"].max()
         frame_df.loc[frame_df["frame"] == last_frame, "speed_kmh_t1"] = np.nan
+        frame_df.loc[frame_df["frame"] == last_frame, "speed_kmh_kalman_t1"] = np.nan
 
-        # Jointure IMU (vitesse, gyro)
+        # Jointure IMU (vitesse GPS brute, vitesse Kalman, gyro)
         imu_sub = (
-            imu[["frame_corrected", "VitGPS(km/h)", "GyrZ(deg/s)"]]
+            imu[["frame_corrected", "VitGPS(km/h)", "speed_kmh_kalman", "GyrZ(deg/s)"]]
             .rename(columns={
                 "frame_corrected": "frame",
                 "VitGPS(km/h)":    "speed_kmh",
@@ -1691,7 +1760,10 @@ for enc_path in sorted(encounter_files):
 
         keep = [
     "source", "frame",
-    "speed_kmh", "speed_kmh_t1", "gyrz_deg_s",
+    "speed_kmh", "speed_kmh_t1",
+    # Vitesse GPS lissée par Kalman position + RTS (réf. compteur, cf. speed/§2)
+    "speed_kmh_kalman", "speed_kmh_kalman_t1",
+    "gyrz_deg_s",
     # Steering (Δyaw intégré sur 1 s, cf. overlay_annotations.py)
     "steering_choice", "delta_yaw_deg",
     "n_vru_total",
@@ -1923,6 +1995,8 @@ else:
         n_frames_uniq               = ("frame", "nunique"),
         speed_mean                  = ("speed_kmh", "mean"),
         speed_max                   = ("speed_kmh", "max"),
+        speed_kalman_mean           = ("speed_kmh_kalman", "mean"),
+        speed_kalman_max            = ("speed_kmh_kalman", "max"),
         n_vru_total_mean            = ("n_vru_total", "mean"),
         n_vru_total_max             = ("n_vru_total", "max"),
         road_width_mean             = ("road_width_perp_m", "mean"),
