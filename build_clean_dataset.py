@@ -647,10 +647,25 @@ def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
 
     df['distance_m']           = distances
 
-    # Décalage latéral (m) — second modèle bbox→mètres (n'utilise pas w)
+    # Décalage latéral (m) — modèle bbox→mètres. ⚠ Le modèle latéral n'est PAS
+    # antisymétrique : sa seule feature horizontale est cx, et appelé tel quel il
+    # renvoie quasi toujours un latéral POSITIF (audit : 85 % "droite", rien
+    # < -1 m, corr azimut = -0.19). CORRECTION : on REPLIE horizontalement les
+    # bbox dont le centre est à GAUCHE de l'axe image (cx < W/2) — seule cx change
+    # sous la réflexion x → W-x — on prédit la magnitude sur la box repliée, puis
+    # on restaure le signe du côté d'origine. Validé : après repliement,
+    # corr(azimuth_deg) = +0.91 et accord de signe = 99 %.
     if _oa_predict_lateral is not None and bboxes:
         try:
-            df['lateral_m'] = _oa_predict_lateral(bboxes)
+            cx_all = np.array([(b[0] + b[2]) / 2.0 for b in bboxes])
+            side   = np.where(cx_all < IMAGE_WIDTH_PX / 2.0, -1.0, 1.0)  # -1 = gauche
+            folded = [
+                (IMAGE_WIDTH_PX - b[2], b[1], IMAGE_WIDTH_PX - b[0], b[3])
+                if s < 0 else (b[0], b[1], b[2], b[3])
+                for b, s in zip(bboxes, side)
+            ]
+            mag = np.asarray(_oa_predict_lateral(folded), dtype=float)
+            df['lateral_m'] = side * mag
         except Exception as e:
             print(f"   ⚠  Échec predict_lateral : {e}")
             df['lateral_m'] = [None] * len(bboxes)
@@ -1708,12 +1723,17 @@ for enc_path in sorted(encounter_files):
             print("   ℹ  Aucune détection autodetect confirmée (frame_df vide)")
             continue
 
-        # speed_kmh_t1 : vitesse IMU à la frame suivante, même source uniquement.
-        # Calculé avant filtrage pour conserver la valeur même si t+1 est filtré.
+        # speed_*_t1 : vitesse IMU une SECONDE plus tard (t+1 s), même source.
+        # Le modèle tourne à 1 Hz : un décalage d'1 frame (~33 ms) rendait la
+        # cible quasi identique au prédicteur une fois agrégée à la seconde
+        # (corr ≈ 0.99998). On décale donc de VIDEO_FPS frames pour viser
+        # réellement la seconde suivante. Calculé avant filtrage pour conserver
+        # la valeur même si l'instant t+1 s est filtré.
+        FPS_STEP  = int(round(VIDEO_FPS))
         speed_map = imu.drop_duplicates("frame_corrected").set_index("frame_corrected")["VitGPS(km/h)"].to_dict()
-        frame_df["speed_kmh_t1"] = frame_df["frame"].add(1).map(speed_map)
+        frame_df["speed_kmh_t1"] = frame_df["frame"].add(FPS_STEP).map(speed_map)
         kalman_map = imu.drop_duplicates("frame_corrected").set_index("frame_corrected")["speed_kmh_kalman"].to_dict()
-        frame_df["speed_kmh_kalman_t1"] = frame_df["frame"].add(1).map(kalman_map)
+        frame_df["speed_kmh_kalman_t1"] = frame_df["frame"].add(FPS_STEP).map(kalman_map)
 
         # (Virages : plus d'exclusion — labellisés via turn_label depuis le GPS.)
 
@@ -1913,6 +1933,23 @@ else:
 
     dataset["rider_id"] = dataset["_device_key"] + "_" + dataset["_vague_key"]
     dataset = dataset.drop(columns=["_device_key", "_vague_key"])
+
+    # ── Vitesse max engin (débridage) — info manuelle par (engin, vague) ──────
+    # 3 engins débridés dans le dataset ; tous les autres sont des engins
+    # standard bridés au cap légal de 25 km/h. Clé = rider_id = "<device>_<vague>".
+    DEVICE_MAX_SPEED_KMH = {
+        "378t_vague1": 30.0,
+        "332t_vague2": 55.0,
+        "335t_vague2": 65.0,
+    }
+    STANDARD_MAX_SPEED_KMH = 25.0
+    dataset["device_max_speed_kmh"] = (
+        dataset["rider_id"].map(DEVICE_MAX_SPEED_KMH).fillna(STANDARD_MAX_SPEED_KMH)
+    )
+    dataset["is_derestricted"] = (dataset["device_max_speed_kmh"] > STANDARD_MAX_SPEED_KMH).astype(int)
+    n_derestr_rider = dataset.loc[dataset["is_derestricted"] == 1, "rider_id"].nunique()
+    print(f"\n  ── Débridage : {n_derestr_rider} engins débridés (Vmax > 25), "
+          f"le reste bridé à {STANDARD_MAX_SPEED_KMH:.0f} km/h ──")
 
     n_missing_rider = dataset["genre"].isna().sum() if "genre" in dataset.columns else 0
     if n_missing_rider > 0:

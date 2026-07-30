@@ -270,13 +270,19 @@ PLOT_VAR_ORDER <- c(
     # ── Prédiction + IC (méthode delta) + IP (ggeffects) ────────────────────────
       tryCatch({
         if (is_mixed) {
-          pred_vals <- predict(fit, newdata = grid, re.form = NA)
+          # nlme::lme → prédiction population via level = 0 ; lme4 → re.form = NA
+          if (inherits(fit, "lme")) {
+            pred_vals <- predict(fit, newdata = grid, level = 0)
+          } else {
+            pred_vals <- predict(fit, newdata = grid, re.form = NA)
+          }
         } else {
           pred_vals <- predict(fit, newdata = grid)
         }
 
         # IC via méthode delta (effets fixes uniquement)
-        X       <- model.matrix(formula(fit, fixed.only = TRUE), data = grid)
+        fx_form <- if (inherits(fit, "lme")) formula(fit) else formula(fit, fixed.only = TRUE)
+        X       <- model.matrix(fx_form, data = grid)
         vc_fix  <- as.matrix(vcov(fit))
         common  <- intersect(colnames(X), colnames(vc_fix))
         X_sub   <- X[, common, drop = FALSE]
@@ -290,11 +296,18 @@ PLOT_VAR_ORDER <- c(
         # Tous les composants aléatoires sont extraits via lme4::VarCorr().
         if (is_mixed) {
           var_resid <- sigma(fit)^2
-          var_ranef <- sum(sapply(lme4::VarCorr(fit),
-                                  function(vc) {
-                                    v <- diag(as.matrix(vc))
-                                    sum(v[is.finite(v) & v > 0])
-                                  }))
+          if (inherits(fit, "lme")) {
+            # nlme : StdDev des effets aléatoires = toutes les valeurs sauf le résidu
+            sds       <- suppressWarnings(as.numeric(nlme::VarCorr(fit)[, "StdDev"]))
+            sds       <- sds[!is.na(sds)]
+            var_ranef <- if (length(sds) > 1) sum(head(sds, -1)^2) else 0
+          } else {
+            var_ranef <- sum(sapply(lme4::VarCorr(fit),
+                                    function(vc) {
+                                      v <- diag(as.matrix(vc))
+                                      sum(v[is.finite(v) & v > 0])
+                                    }))
+          }
           se_pi <- sqrt(var_ci + var_resid + var_ranef)
         } else {
           pred_pi <- predict(fit, newdata = grid,
@@ -608,6 +621,16 @@ PLOT_VAR_ORDER <- c(
           ))
         }
       }
+    }
+  }
+
+  # ── Corrélation temporelle AR(p) (modèles nlme::lme + corARMA) ───────────────
+  if (!is.null(metrics$phi)) {
+    ord <- if (!is.null(metrics$ar_order)) metrics$ar_order else length(metrics$phi)
+    for (i in seq_along(metrics$phi)) {
+      rows <- c(rows, list(c(
+        sprintf("$\\varphi_{%d}$ (AR(%d))", i, ord),
+        sprintf("%.4f", metrics$phi[i]))))
     }
   }
 
@@ -963,4 +986,197 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
   invisible(list(fit = fit, params = params_df, metrics = metrics))
 }
 
-cat("✔ Fonctions R chargées : run_linear, run_mixed_linear_panel\n")
+# ══════════════════════════════════════════════════════════════════════════════
+# run_mixed_linear_panel_ar(df_est, rhs, model_name, ...)
+#   Même sortie complète que run_mixed_linear_panel (console formatée, params.csv,
+#   params.tex, stats.tex, plots marginaux, $metrics) mais avec nlme::lme +
+#   corARMA(p = ar_order, q = 0) : corrélation temporelle AR(p) sur les résidus
+#   intra-trajet. Utilisé pour M6 (AR1) et M6b (AR2).
+# ══════════════════════════════════════════════════════════════════════════════
+run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
+                                      panel_id_col = c("rider_id", "source"),
+                                      time_col     = "second",
+                                      ar_order     = 1,
+                                      method       = "ML",
+                                      make_plots   = TRUE) {
+  use_reml   <- identical(toupper(method), "REML")
+  panel_cols <- panel_id_col
+
+  formula_obj <- as.formula(paste0("speed_kmh_kalman_t1 ~ ", rhs))
+
+  vars_used <- unique(c("speed_kmh_kalman_t1", panel_cols, time_col,
+                        all.vars(as.formula(paste("~", rhs)))))
+  vars_used <- vars_used[vars_used %in% names(df_est)]
+  data      <- df_est[, vars_used, drop = FALSE]
+  for (cn in names(data)) if (is.character(data[[cn]])) data[[cn]] <- factor(data[[cn]])
+  before  <- nrow(data)
+  data    <- data[complete.cases(data), ]
+  dropped <- before - nrow(data)
+  if (dropped > 0) message(sprintf("[%s] ⚠ %d lignes supprimées (NaN)", model_name, dropped))
+  data <- data[do.call(order, c(data[panel_cols], list(data[[time_col]]))), ]
+
+  N_obs    <- nrow(data)
+  N_riders <- length(unique(data[[panel_cols[1]]]))
+
+  # ── Structures aléatoire (emboîtée) et de corrélation AR(p) ─────────────────
+  nested_grp  <- paste(panel_cols, collapse = "/")
+  ar_start    <- switch(as.character(ar_order), "1" = 0.8, "2" = c(0.5, 0.2), rep(0.2, ar_order))
+  ctrl        <- nlme::lmeControl(opt = "nlminb", maxIter = 300, msMaxIter = 300, returnObject = TRUE)
+  reml_method <- if (use_reml) "REML" else "ML"
+
+  fit_one <- function(grp) {
+    nlme::lme(formula_obj,
+              random      = as.formula(paste("~ 1 |", grp)),
+              correlation = nlme::corARMA(ar_start,
+                              form = as.formula(paste("~", time_col, "|", grp)),
+                              p = ar_order, q = 0),
+              data = data, method = reml_method, control = ctrl)
+  }
+  used_panel <- panel_cols
+  fit <- tryCatch(fit_one(nested_grp), error = function(e) {
+    message(sprintf("[%s] emboîté non convergé (%s) → repli sur ~ 1 | %s",
+                    model_name, conditionMessage(e), panel_cols[length(panel_cols)]))
+    used_panel <<- panel_cols[length(panel_cols)]
+    fit_one(used_panel)
+  })
+
+  phi <- as.numeric(coef(fit$modelStruct$corStruct, unconstrained = FALSE))
+
+  # ── Log-vraisemblance, ρ² et LRT vs nul (même structure RE + AR, β = μ) ──────
+  ll <- as.numeric(logLik(fit)); k <- attr(logLik(fit), "df")
+  ll_null_ols <- as.numeric(logLik(lm(speed_kmh_kalman_t1 ~ 1, data = data)))
+  fit_null <- tryCatch(
+    nlme::lme(speed_kmh_kalman_t1 ~ 1,
+              random      = as.formula(paste("~ 1 |", paste(used_panel, collapse = "/"))),
+              correlation = nlme::corARMA(ar_start,
+                              form = as.formula(paste("~", time_col, "|", paste(used_panel, collapse = "/"))),
+                              p = ar_order, q = 0),
+              data = data, method = "ML", control = ctrl),
+    error = function(e) NULL)
+  if (!is.null(fit_null)) {
+    ll_null <- as.numeric(logLik(fit_null)); k_null <- attr(logLik(fit_null), "df")
+    lrt_stat <- -2 * (ll_null - ll); lrt_df <- k - k_null
+    lrt_p <- if (lrt_df > 0) pchisq(lrt_stat, df = lrt_df, lower.tail = FALSE) else NA
+  } else { ll_null <- NA; lrt_stat <- NA; lrt_df <- NA; lrt_p <- NA }
+
+  rho2     <- 1 - ll / ll_null_ols
+  rho2_bar <- 1 - (ll - k) / ll_null_ols
+  aic_val  <- AIC(fit); bic_val <- BIC(fit)
+
+  sig_str <- if (!is.na(lrt_p) && lrt_p < 0.001) " ***" else
+             if (!is.na(lrt_p) && lrt_p < 0.01)  " **"  else
+             if (!is.na(lrt_p) && lrt_p < 0.05)  " *"   else " (n.s.)"
+
+  # ── Écarts-types aléatoires (nlme::VarCorr : outer → inner → résidu) ─────────
+  sds       <- suppressWarnings(as.numeric(nlme::VarCorr(fit)[, "StdDev"]))
+  sds       <- sds[!is.na(sds)]
+  sigma_eps <- sds[length(sds)]
+  re_sds    <- sds[-length(sds)]
+  sigma_rid <- re_sds[1]
+  icc       <- sigma_rid^2 / (sum(re_sds^2) + sigma_eps^2)
+
+  extra_sigmas <- list(); extra_ns <- list(); extra_lrts <- list()
+  if (length(used_panel) > 1) {
+    for (j in seq_along(used_panel[-1])) {
+      pc <- used_panel[j + 1]
+      extra_sigmas[[pc]] <- if (length(re_sds) >= j + 1) round(re_sds[j + 1], 4) else NA
+      extra_ns[[pc]]     <- length(unique(data[[pc]]))
+      extra_lrts[[pc]]   <- list(lrt = NA, p = NA)   # pas de ranova en nlme
+    }
+  }
+
+  # ── R² marginal / conditionnel (Nakagawa) ───────────────────────────────────
+  r2 <- tryCatch(MuMIn::r.squaredGLMM(fit), error = function(e)
+          matrix(NA, 1, 2, dimnames = list(NULL, c("R2m", "R2c"))))
+  r2_marginal <- r2[1, "R2m"]; r2_conditional <- r2[1, "R2c"]
+
+  # ── Table des paramètres au format lmer (pour .params_to_latex / plots) ──────
+  tt <- summary(fit)$tTable
+  params_df <- data.frame(
+    Estimate     = tt[, "Value"],
+    `Std. Error` = tt[, "Std.Error"],
+    df           = tt[, "DF"],
+    `t value`    = tt[, "t-value"],
+    `Pr(>|t|)`   = tt[, "p-value"],
+    check.names  = FALSE, row.names = rownames(tt)
+  )
+
+  cat(sprintf("\n%s\n", strrep("=", 72)))
+  cat(sprintf("  Mixed panel linear model + AR(%d): %s  [method: %s]\n", ar_order, model_name, toupper(method)))
+  cat(sprintf("  Panel: %s  |  temps: %s\n", paste(used_panel, collapse = " + "), time_col))
+  cat(sprintf("  Riders=%d  Observations=%d\n", N_riders, N_obs))
+  cat(sprintf("  sigma_%s=%.4f  sigma_eps=%.4f\n", used_panel[1], sigma_rid, sigma_eps))
+  cat(sprintf("  phi (AR%d) = %s\n", ar_order, paste(sprintf("%.4f", phi), collapse = ", ")))
+  cat(sprintf("  Modèle nul      : LL=%s\n", if (is.na(ll_null)) "NA" else sprintf("%.2f", ll_null)))
+  cat(sprintf("  Modèle principal: K=%d  LL=%.2f\n", k, ll))
+  cat(sprintf("  Rm²=%.4f  Rc²=%.4f\n", r2_marginal, r2_conditional))
+  cat(sprintf("  rho²=%.4f  AIC=%.1f  BIC=%.1f\n", rho2, aic_val, bic_val))
+  cat(sprintf("  LRT vs nul : chi²(%s)=%s  p=%s%s\n",
+              ifelse(is.na(lrt_df), "NA", lrt_df),
+              ifelse(is.na(lrt_stat), "NA", sprintf("%.2f", lrt_stat)),
+              ifelse(is.na(lrt_p), "NA", sprintf("%.4f", lrt_p)), sig_str))
+  cat(sprintf("%s\n", strrep("=", 72)))
+  print(params_df)
+
+  # ── Corrélations entre betas estimés ────────────────────────────────────────
+  cor_beta <- cov2cor(as.matrix(vcov(fit)))
+  cor_beta[lower.tri(cor_beta, diag = TRUE)] <- NA
+  idx_b <- which(!is.na(cor_beta), arr.ind = TRUE)
+  if (nrow(idx_b) > 0) {
+    cbp <- data.frame(var1 = rownames(cor_beta)[idx_b[, 1]],
+                      var2 = colnames(cor_beta)[idx_b[, 2]],
+                      r    = cor_beta[idx_b], stringsAsFactors = FALSE)
+    cbp <- cbp[order(abs(cbp$r), decreasing = TRUE), ]
+    cat(sprintf("\n  [%s] Corrélations entre betas estimés (|r| décroissant) :\n", model_name))
+    for (i in seq_len(min(nrow(cbp), 15))) {
+      flag <- if (abs(cbp$r[i]) > 0.7) "  ⚠ > 0.7" else ""
+      cat(sprintf("    cor(%-28s, %-28s) = %+.3f%s\n", cbp$var1[i], cbp$var2[i], cbp$r[i], flag))
+    }
+    cat("\n")
+  }
+
+  metrics <- list(
+    Model = model_name, N = N_obs, N_riders = N_riders, K = k,
+    LL_null = round(ll_null_ols, 2), LL_final = round(ll, 2),
+    rho2 = round(rho2, 4), rho2_bar = round(rho2_bar, 4),
+    AIC = round(aic_val, 2), BIC = round(bic_val, 2),
+    LRT_stat = if (!is.na(lrt_stat)) round(lrt_stat, 2) else NA, LRT_df = lrt_df,
+    LRT_p = if (!is.na(lrt_p)) round(lrt_p, 4) else NA,
+    r2_marginal = round(r2_marginal, 4), r2_conditional = round(r2_conditional, 4),
+    sigma_rider = round(sigma_rid, 4), sigma_eps = round(sigma_eps, 4), ICC = round(icc, 4),
+    sigma_rider_lrt = NA, sigma_rider_p = NA,
+    extra_sigmas = extra_sigmas, extra_ns = extra_ns, extra_lrts = extra_lrts,
+    phi = round(phi, 4), ar_order = ar_order
+  )
+
+  # ── Sauvegardes (params.csv, params.tex, stats.tex, plots) ──────────────────
+  out_dir <- .get_out_dir(model_name)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  write.csv(params_df, file.path(out_dir, paste0(model_name, "_params.csv")))
+
+  sigmas_list <- list(list(label = "$\\sigma_{\\text{rider}}$", value = metrics$sigma_rider))
+  if (length(metrics$extra_sigmas) > 0) {
+    for (pc in names(metrics$extra_sigmas)) {
+      lbl <- if (pc == "source") "$\\sigma_{\\text{trip}}$" else sprintf("$\\sigma_{\\text{%s}}$", pc)
+      sigmas_list <- c(sigmas_list, list(list(label = lbl, value = metrics$extra_sigmas[[pc]])))
+    }
+  }
+  sigmas_list <- c(sigmas_list, list(list(label = "$\\sigma_{\\varepsilon}$", value = metrics$sigma_eps)))
+
+  writeLines(.params_to_latex(params_df, model_name,
+               equation = .build_equation_latex(params_df, mixed = TRUE, panel_cols = used_panel),
+               sigmas   = sigmas_list),
+             file.path(out_dir, paste0(model_name, "_params.tex")))
+  writeLines(.stats_to_latex(metrics, model_name),
+             file.path(out_dir, paste0(model_name, "_stats.tex")))
+  if (make_plots) {
+    tryCatch(.plot_marginal_means(fit, params_df, data, model_name, out_dir,
+                                  is_mixed = TRUE, raw_data = df_est),
+             error = function(e) message(sprintf("[%s] plots marginaux ignorés : %s",
+                                                 model_name, conditionMessage(e))))
+  }
+
+  invisible(list(fit = fit, params = params_df, metrics = metrics))
+}
+
+cat("✔ Fonctions R chargées : run_linear, run_mixed_linear_panel, run_mixed_linear_panel_ar\n")

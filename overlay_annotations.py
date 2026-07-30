@@ -7,11 +7,15 @@ Affiche uniquement les bbox CODÉES (encounter avec CONFIRM == 1) avec :
   - encounter_type (= INTERACTION_TYPE)
 
 Inputs (par clip) :
-  <ESCOOTER_DIR>/<clip>.mp4
+  <ESCOOTER_DIR>/<clip>.mp4                         (image brute, pas Canny)
+  <ESCOOTER_DIR>/<clip>_corrected_with_offset_gpsfixed.csv   (IMU + GPS recalé)
   <CODEBOOK>/<clip>_debug_autodetect.csv
-  <CODEBOOK>/<clip>_rater2_encounters_debug_encounters.csv
+  <CODEBOOK>/<clip>_rater<N>_encounters_debug_encounters.csv (N quelconque)
 Output :
-  <OUT_DIR>/<clip>_annotated_codes.mp4
+  <OUT_DIR>/<clip>_annotated_codes_raw.mp4
+
+La vitesse affichée est la vitesse GPS Kalman (cf. kalman_speed.py), identique à
+la colonne speed_kmh_kalman du dataset.
 """
 
 import os
@@ -39,8 +43,11 @@ AUTODET_SUFFIX = "_debug_autodetect.csv"
 # IMU + GPS recalé (lag GPS estimé par clip déjà appliqué). La vitesse Kalman
 # est calculée à partir de Lat/Long (cf. load_speed_by_frame).
 SPEED_SUFFIX   = "_corrected_with_offset_gpsfixed.csv"
-VIDEO_SUFFIX   = "_canny.mp4"             # vidéo source (filtre Canny)
-OUT_SUFFIX     = "_annotated_codes.mp4"
+# Vidéo source : image BRUTE (non-canny). Le variant Canny est "_canny.mp4".
+VIDEO_SUFFIX   = ".mp4"
+# Nom de sortie distinct de celui des rendus Canny (_annotated_codes.mp4), pour
+# ne pas écraser les vidéos déjà produites à partir des sources Canny.
+OUT_SUFFIX     = "_annotated_codes_raw.mp4"
 LANES_SUFFIX   = "_corrected_lanes.csv"         # courbes curb gauche/droite
 CALIB_SUFFIX   = "_calibration.json"            # calibration caméra (sténopé)
 
