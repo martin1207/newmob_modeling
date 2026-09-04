@@ -15,6 +15,7 @@
 *.json
 *.html
 *.bak
+*.jpeg
 *encounters.csv
 clean_dataset.csv
 clean_dataset_vru_detections.csv
@@ -34,6 +35,7 @@ build/
 # Environnements
 # ======================
 .venv/
+.venv-rfdetr/
 venv/
 env/
 
