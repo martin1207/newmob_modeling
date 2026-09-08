@@ -1,18 +1,18 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # functions_linear.R
 # Equivalent R de funtion_linear.py
-# Packages requis : lme4, lmerTest
+# Packages requis : nlme, MuMIn, clubSandwich
 # ══════════════════════════════════════════════════════════════════════════════
 
 suppressPackageStartupMessages({
-  library(lme4)
-  library(lmerTest)   # ajoute les p-valeurs aux lmer (approx. Satterthwaite)
+  # lme4/lmerTest ne sont plus utilisés : tous les modèles mixtes passent par nlme
+  # (run_mixed_linear_panel délègue à run_mixed_linear_panel_ar avec ar_order = 0).
   if (!requireNamespace("MuMIn",     quietly = TRUE)) install.packages("MuMIn",     repos = "https://cloud.r-project.org")
   if (!requireNamespace("showtext",  quietly = TRUE)) install.packages("showtext",  repos = "https://cloud.r-project.org")
   if (!requireNamespace("sysfonts",  quietly = TRUE)) install.packages("sysfonts",  repos = "https://cloud.r-project.org")
   if (!requireNamespace("ggeffects", quietly = TRUE)) install.packages("ggeffects", repos = "https://cloud.r-project.org")
   library(MuMIn)      # r.squaredGLMM : R² marginal et conditionnel
-  library(nlme)       # lme + corAR1 : modèle AR(1) sur les résidus
+  library(nlme)       # lme (+ corARMA) : tous les modèles mixtes
 })
 
 # ── Labels LaTeX ──────────────────────────────────────────────────────────────
@@ -77,6 +77,9 @@ PLOT_VAR_ORDER <- c(
 # Interactions A:B → β_{\text{A} × \text{B}} (× hors \text{}).
 .name_to_beta <- function(nm) {
   if (nm == "(Intercept)") return("\\mu")
+  if (nm == "z_speed_kmh_kalman") return("\\theta")
+  if (nm == "z_speed_kmh_kalman_t0") return("\\b_0")
+
   if (grepl(":", nm)) {
     parts  <- strsplit(nm, ":")[[1]]
     cleans <- sapply(parts, .id_text)
@@ -85,6 +88,47 @@ PLOT_VAR_ORDER <- c(
                   "}"))
   }
   paste0("\\beta_{\\text{", .id_text(nm), "}}")
+}
+
+# ── SE cluster-robustes CR2 (clubSandwich) au format params_df ────────────────
+# Renvoie un data.frame avec mêmes colonnes que summary()$coefficients
+# (Estimate / Std. Error / df / t value / Pr(>|t|)) mais SE/t/p cluster-robustes
+# CR2 + dof de Satterthwaite, clusterisées par `cluster_col`. Estimations
+# inchangées. Repli (avec warning) sur le modèle si clubSandwich indisponible.
+.robust_params_df <- function(fit, cluster_col = "rider_id") {
+  if (!requireNamespace("clubSandwich", quietly = TRUE)) {
+    warning("clubSandwich absent → colonnes robustes omises"); return(NULL)
+  }
+  d  <- tryCatch(nlme::getData(fit), error = function(e) NULL)
+  if (is.null(d)) d <- tryCatch(model.frame(fit), error = function(e) NULL)
+  cl <- if (!is.null(d) && cluster_col %in% names(d)) d[[cluster_col]] else NULL
+  ct <- tryCatch(
+    clubSandwich::coef_test(fit, vcov = "CR2", cluster = cl, test = "Satterthwaite"),
+    error = function(e) { warning(sprintf("coef_test CR2 échoué (%s) → colonnes robustes omises",
+                                          conditionMessage(e))); NULL })
+  if (is.null(ct)) return(NULL)
+  tab <- as.data.frame(ct)
+  nm  <- if ("Coef" %in% names(tab)) as.character(tab$Coef) else rownames(tab)
+  dfv <- if ("df_Satt" %in% names(tab)) tab$df_Satt else tab$df
+  pv  <- if ("p_Satt" %in% names(tab)) tab$p_Satt else if ("p_val" %in% names(tab)) tab$p_val else NA
+  out <- data.frame(Estimate = tab$beta, `Std. Error` = tab$SE, df = dfv,
+                    `t value` = tab$tstat, `Pr(>|t|)` = pv,
+                    check.names = FALSE, row.names = nm)
+  attr(out, "n_clusters") <- length(unique(cl)); attr(out, "cluster_col") <- cluster_col
+  out
+}
+
+# Fusionne les colonnes robustes (SE_CR2, t_CR2, df_CR2, p_CR2) dans le CSV params.
+.merge_robust_csv <- function(params_df, robust_df) {
+  out <- as.data.frame(params_df)
+  if (!is.null(robust_df)) {
+    m <- match(rownames(out), rownames(robust_df))
+    out[["SE_CR2"]] <- robust_df[["Std. Error"]][m]
+    out[["t_CR2"]]  <- robust_df[["t value"]][m]
+    out[["df_CR2"]] <- robust_df[["df"]][m]
+    out[["p_CR2"]]  <- robust_df[["Pr(>|t|)"]][m]
+  }
+  out
 }
 
 # ── Utilitaires internes ──────────────────────────────────────────────────────
@@ -293,7 +337,8 @@ PLOT_VAR_ORDER <- c(
 
         # IP pour une nouvelle observation d'un nouveau groupe (rider + trip) :
         #   se_PI = sqrt(var_IC_fixes + σ²_ε + σ²_rider + σ²_trip + ...)
-        # Tous les composants aléatoires sont extraits via lme4::VarCorr().
+        # Composants aléatoires : StdDev nlme ; repli lme4 si un merMod est passé
+        # de l'extérieur (plus produit par ce fichier).
         if (is_mixed) {
           var_resid <- sigma(fit)^2
           if (inherits(fit, "lme")) {
@@ -302,11 +347,12 @@ PLOT_VAR_ORDER <- c(
             sds       <- sds[!is.na(sds)]
             var_ranef <- if (length(sds) > 1) sum(head(sds, -1)^2) else 0
           } else {
-            var_ranef <- sum(sapply(lme4::VarCorr(fit),
-                                    function(vc) {
-                                      v <- diag(as.matrix(vc))
-                                      sum(v[is.finite(v) & v > 0])
-                                    }))
+            var_ranef <- if (requireNamespace("lme4", quietly = TRUE))
+              sum(sapply(lme4::VarCorr(fit),
+                         function(vc) {
+                           v <- diag(as.matrix(vc))
+                           sum(v[is.finite(v) & v > 0])
+                         })) else 0
           }
           se_pi <- sqrt(var_ci + var_resid + var_ranef)
         } else {
@@ -412,19 +458,23 @@ PLOT_VAR_ORDER <- c(
 # ── Export LaTeX : tableau des paramètres ─────────────────────────────────────
 # sigmas : liste de list(label=..., value=...) pour les écarts-types aléatoires
 .params_to_latex <- function(params_df, model_name,
-                              equation = NULL, sigmas = NULL) {
+                              equation = NULL, sigmas = NULL, robust_df = NULL) {
   skip_patterns <- c("^sd_", "^cor_", "^sigma$", "^Residual$")
+  has_rob <- !is.null(robust_df)
 
   eq_block <- if (!is.null(equation)) {
-    paste0("\\The final expression for the speed is \n", equation, "\n\n")
+    paste0("\\ The final expression for the speed is \n", equation, "\n\n")
   } else ""
 
   lines <- c(
     eq_block,
     "\\begin{table}[h!]\\centering\\small",
-    "\\begin{tabular}{lrrrr}",
+    paste0("\\begin{tabular}{", if (has_rob) "lrrrrrr" else "lrrrr", "}"),
     "\\hline\\hline",
-    "Parameter & Value & Std. err. & $t$-stat. & $p$-value \\\\",
+    if (has_rob)
+      "Parameter & Value & Std. err. & $t$-stat. & $p$-value & SE$_{\\text{CR2}}$ & $p_{\\text{CR2}}$ \\\\"
+    else
+      "Parameter & Value & Std. err. & $t$-stat. & $p$-value \\\\",
     "\\hline"
   )
 
@@ -438,9 +488,19 @@ PLOT_VAR_ORDER <- c(
 
     sig  <- .sig_stars(pv)
     pstr <- if (is.na(pv)) "---" else sprintf("%.4f", pv)
-    lines <- c(lines,
-      sprintf("%s & %.4f & %.4f & %.3f & %s%s \\\\",
-              .beta_label(nm), est, se, tv, pstr, sig))
+    if (has_rob) {
+      rse <- if (nm %in% rownames(robust_df)) robust_df[nm, "Std. Error"] else NA
+      rpv <- if (nm %in% rownames(robust_df)) robust_df[nm, "Pr(>|t|)"]   else NA
+      rse_str <- if (is.na(rse)) "---" else sprintf("%.4f", rse)
+      rp_str  <- if (is.na(rpv)) "---" else sprintf("%.4f%s", rpv, .sig_stars(rpv))
+      lines <- c(lines,
+        sprintf("%s & %.4f & %.4f & %.3f & %s%s & %s & %s \\\\",
+                .beta_label(nm), est, se, tv, pstr, sig, rse_str, rp_str))
+    } else {
+      lines <- c(lines,
+        sprintf("%s & %.4f & %.4f & %.3f & %s%s \\\\",
+                .beta_label(nm), est, se, tv, pstr, sig))
+    }
   }
 
   # Bloc effets aléatoires (sigmas) en bas du tableau
@@ -448,8 +508,8 @@ PLOT_VAR_ORDER <- c(
     lines <- c(lines, "\\hline")
     for (s in sigmas) {
       val_str <- if (is.na(s$value)) "---" else sprintf("%.4f km/h", s$value)
-      lines <- c(lines,
-        sprintf("%s & %s & --- & --- & --- \\\\", s$label, val_str))
+      tail_d  <- if (has_rob) "--- & --- & --- & --- & ---" else "--- & --- & ---"
+      lines <- c(lines, sprintf("%s & %s & %s \\\\", s$label, val_str, tail_d))
     }
   }
 
@@ -457,7 +517,9 @@ PLOT_VAR_ORDER <- c(
     "\\hline\\hline",
     "\\end{tabular}",
     paste0("\\caption{Estimated parameters of the linear regression",
-           " model predicting the speed}"),
+           " model predicting the speed",
+           if (has_rob) " (model-based SE and cluster-robust CR2 SE, clustered by rider)" else "",
+           ".}"),
     paste0("\\label{tab:", model_name, "_params}"),
     "\\end{table}"
   )
@@ -779,211 +841,33 @@ run_linear <- function(df_est, rhs, model_name, ref = NULL) {
   invisible(list(fit = fit, params = params_df, metrics = metrics))
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# run_mixed_linear_panel(df_est, rhs, model_name, ...)
+#   Modèle à intercepts aléatoires SANS structure temporelle. Depuis le passage
+#   à nlme, ce n'est plus qu'un cas particulier de run_mixed_linear_panel_ar
+#   (ar_order = 0) : même moteur, même sortie, mêmes fichiers. On délègue donc
+#   plutôt que de dupliquer 200 lignes.
+#
+#   Deux différences avec l'ancienne implémentation lme4 :
+#     • plusieurs niveaux de panel sont EMBOÎTÉS (~ 1 | a/b) et non croisés
+#       ((1|a) + (1|b)). Identique ici, où les identifiants de trajet sont
+#       uniques par rider, mais la formule affichée change.
+#     • les LRT sur les variances (ex-`lmerTest::ranova`) sont obtenus en
+#       réajustant explicitement chaque modèle nul (cf. run_mixed_linear_panel_ar).
+# ══════════════════════════════════════════════════════════════════════════════
 run_mixed_linear_panel <- function(df_est, rhs, model_name,
                                    panel_id_col = "rider_id",
-                                   method = "ML") {
-  # method : "ML"   = maximum likelihood   (REML=FALSE, LRT sur effets fixes valide)
-  #          "REML" = restricted likelihood (REML=TRUE,  LRT sur effets fixes invalide)
-  #          Les deux méthodes utilisent REML=FALSE pour le LRT (fit ML interne).
-  use_reml <- identical(toupper(method), "REML")
-
-  # panel_id_col peut être un vecteur de colonnes, ex. c("rider_id", "source")
-  panel_cols <- panel_id_col
-
-  # Construction des termes aléatoires : (1|col1) + (1|col2) + ...
-  re_terms <- paste(sprintf("(1|%s)", panel_cols), collapse = " + ")
-
-  formula_obj  <- as.formula(paste0("speed_kmh_kalman_t1 ~ ", rhs, " + ", re_terms))
-  formula_null <- as.formula(paste0("speed_kmh_kalman_t1 ~ ", re_terms))
-
-  vars_used <- unique(c("speed_kmh_kalman_t1", panel_cols,
-                         all.vars(as.formula(paste("~", rhs)))))
-  vars_used <- vars_used[vars_used %in% names(df_est)]
-  data      <- df_est[, vars_used, drop = FALSE]
-  # Convertir les colonnes character en factor pour que lmer encode correctement
-  for (cn in names(data)) {
-    if (is.character(data[[cn]])) data[[cn]] <- factor(data[[cn]])
-  }
-  before    <- nrow(data)
-  data      <- data[complete.cases(data), ]
-  dropped   <- before - nrow(data)
-  if (dropped > 0) message(sprintf("[%s] ⚠ %d lignes supprimées (NaN)", model_name, dropped))
-
-  # Trier par premier identifiant panel
-  data <- data[order(data[[panel_cols[1]]]), ]
-
-  N_obs    <- nrow(data)
-  N_riders <- length(unique(data[[panel_cols[1]]]))
-
-  # ── Estimation principale ─────────────────────────────────────────────────
-  fit  <- lmer(formula_obj,  data = data, REML = use_reml)
-  if (use_reml) {
-    message(sprintf("[%s] ℹ REML=TRUE : re-estimation ML interne pour LRT sur effets fixes.", model_name))
-    fit_ml  <- lmer(formula_obj,  data = data, REML = FALSE)
-    fit0_ml <- lmer(formula_null, data = data, REML = FALSE)
-  } else {
-    fit_ml  <- fit
-    fit0_ml <- lmer(formula_null, data = data, REML = FALSE)
-  }
-  fit0 <- fit0_ml   # nul toujours en ML pour LRT
-
-  ll      <- as.numeric(logLik(fit_ml))
-  ll_null <- as.numeric(logLik(fit0_ml))   # nul lmer (RE seuls) → LRT
-  k       <- attr(logLik(fit_ml),  "df")
-  k_null  <- attr(logLik(fit0_ml), "df")
-
-  # Nul OLS pur (μ seul, sans RE) → ρ² comparable à run_linear
-  ll_null_ols <- as.numeric(logLik(lm(speed_kmh_kalman_t1 ~ 1, data = data)))
-  k_null_ols  <- 2L   # μ + σ
-
-  # ── Métriques ─────────────────────────────────────────────────────────────
-  rho2     <- 1 - ll / ll_null_ols
-  rho2_bar <- 1 - (ll - k) / ll_null_ols
-  aic_val  <- AIC(fit)
-  bic_val  <- BIC(fit)
-  lrt_stat <- -2 * (ll_null - ll)
-  lrt_df   <- k - k_null
-  lrt_p    <- if (lrt_df > 0) pchisq(lrt_stat, df = lrt_df, lower.tail = FALSE) else NA
-
-  sig_str <- if (!is.na(lrt_p) && lrt_p < 0.001) " ***" else
-             if (!is.na(lrt_p) && lrt_p < 0.01)  " **"  else
-             if (!is.na(lrt_p) && lrt_p < 0.05)  " *"   else " (n.s.)"
-
-  # Effets aléatoires
-  re_df     <- as.data.frame(VarCorr(fit))
-  sigma_rid <- sqrt(re_df$vcov[re_df$grp == panel_cols[1]])
-  sigma_eps <- sqrt(re_df$vcov[re_df$grp == "Residual"])
-
-  icc <- sigma_rid^2 / (sigma_rid^2 + sigma_eps^2)
-
-  # ── R² marginal et conditionnel (MuMIn::r.squaredGLMM, Nakagawa & Schielzeth 2013) ──
-  r2_mumin       <- r.squaredGLMM(fit)
-  r2_marginal    <- r2_mumin[1, "R2m"]
-  r2_conditional <- r2_mumin[1, "R2c"]
-
-  cat(sprintf("\n%s\n", strrep("=", 72)))
-  cat(sprintf("  Mixed panel linear model: %s  [method: %s]\n", model_name, toupper(method)))
-  cat(sprintf("  Panel: %s\n", paste(panel_cols, collapse = " + ")))
-  cat(sprintf("  Riders=%d  Observations=%d\n", N_riders, N_obs))
-  cat(sprintf("  sigma_%s=%.4f  sigma_eps=%.4f\n", panel_cols[1], sigma_rid, sigma_eps))
-  cat(sprintf("  Modèle nul      : LL=%.2f\n", ll_null))
-  cat(sprintf("  Modèle principal: K=%d  LL=%.2f\n", k, ll))
-  cat(sprintf("  Rm²=%.4f  Rc²=%.4f\n", r2_marginal, r2_conditional))
-  cat(sprintf("  rho²=%.4f  AIC=%.1f  BIC=%.1f\n", rho2, aic_val, bic_val))
-  cat(sprintf("  LRT vs nul : chi²(%d)=%.2f  p=%.4f%s\n",
-              lrt_df, lrt_stat, lrt_p, sig_str))
-  cat(sprintf("%s\n", strrep("=", 72)))
-  print(summary(fit)$coefficients)
-
-  # ── Corrélations entre betas estimés (cov2cor sur vcov des effets fixes) ──
-  cor_beta <- cov2cor(as.matrix(vcov(fit)))
-  cor_beta[lower.tri(cor_beta, diag = TRUE)] <- NA
-  idx_b <- which(!is.na(cor_beta), arr.ind = TRUE)
-  if (nrow(idx_b) > 0) {
-    cor_beta_pairs <- data.frame(
-      var1 = rownames(cor_beta)[idx_b[, 1]],
-      var2 = colnames(cor_beta)[idx_b[, 2]],
-      r    = cor_beta[idx_b],
-      stringsAsFactors = FALSE
-    )
-    cor_beta_pairs <- cor_beta_pairs[order(abs(cor_beta_pairs$r), decreasing = TRUE), ]
-    cat(sprintf("\n  [%s] Corrélations entre betas estimés (ordre décroissant |r|) :\n", model_name))
-    for (i in seq_len(nrow(cor_beta_pairs))) {
-      flag <- if (abs(cor_beta_pairs$r[i]) > 0.7) "  ⚠ > 0.7" else ""
-      cat(sprintf("    cor(%-30s, %-30s) = %+.3f%s\n",
-                  cor_beta_pairs$var1[i], cor_beta_pairs$var2[i], cor_beta_pairs$r[i], flag))
-    }
-    cat("\n")
-  }
-
-  # Effets aléatoires supplémentaires (panel cols 2+) + LRT via ranova
-  extra_sigmas <- list()
-  extra_ns     <- list()
-  extra_lrts   <- list()   # list(lrt=..., p=...)
-  if (length(panel_cols) > 1) {
-    ranova_res_all <- ranova(fit)
-    for (pc in panel_cols[-1]) {
-      sig_val <- re_df$vcov[re_df$grp == pc]
-      extra_sigmas[[pc]] <- if (length(sig_val) > 0) round(sqrt(sig_val), 4) else NA
-      extra_ns[[pc]]     <- length(unique(data[[pc]]))
-      row_idx <- grep(pc, rownames(ranova_res_all), value = FALSE)[1]
-      if (!is.na(row_idx)) {
-        extra_lrts[[pc]] <- list(
-          lrt = round(ranova_res_all[["LRT"]][row_idx], 2),
-          p   = ranova_res_all[["Pr(>Chisq)"]][row_idx]
-        )
-      } else {
-        extra_lrts[[pc]] <- list(lrt = NA, p = NA)
-      }
-    }
-  }
-
-  # p-value pour sigma du 1er panel col via ranova (LRT sigma=0)
-  ranova_res      <- ranova(fit)
-  ranova_row      <- grep(panel_cols[1], rownames(ranova_res), value = FALSE)[1]
-  if (!is.na(ranova_row)) {
-    sigma_rider_lrt <- ranova_res[["LRT"]][ranova_row]
-    sigma_rider_p   <- ranova_res[["Pr(>Chisq)"]][ranova_row]
-  } else {
-    sigma_rider_lrt <- NA
-    sigma_rider_p   <- NA
-  }
-
-  metrics <- list(
-    Model         = model_name,
-    N             = N_obs,
-    N_riders      = N_riders,
-    K             = k,
-    LL_null       = round(ll_null_ols,   2),   # μ OLS pur (base du ρ²)
-    LL_final      = round(ll,           2),
-    rho2          = round(rho2,         4),
-    rho2_bar      = round(rho2_bar,     4),
-    AIC           = round(aic_val,      2),
-    BIC           = round(bic_val,      2),
-    LRT_stat      = round(lrt_stat,     2),
-    LRT_df        = lrt_df,
-    LRT_p         = if (!is.na(lrt_p)) round(lrt_p, 4) else NA,
-    r2_marginal    = round(r2_marginal,    4),
-    r2_conditional = round(r2_conditional, 4),
-    sigma_rider   = round(sigma_rid,    4),
-    sigma_eps     = round(sigma_eps,    4),
-    ICC           = round(icc,          4),
-    sigma_rider_lrt = if (!is.na(sigma_rider_lrt)) round(sigma_rider_lrt, 2) else NA,
-    sigma_rider_p   = sigma_rider_p,
-    extra_sigmas  = extra_sigmas,
-    extra_ns      = extra_ns,
-    extra_lrts    = extra_lrts
-  )
-
-  # ── Sauvegarde ────────────────────────────────────────────────────────────
-  out_dir   <- .get_out_dir(model_name)
-  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  params_df <- as.data.frame(summary(fit)$coefficients)
-  write.csv(params_df, file.path(out_dir, paste0(model_name, "_params.csv")))
-
-  # Construire la liste des sigmas pour params.tex
-  sigmas_list <- list(
-    list(label = "$\\sigma_{\\text{rider}}$", value = metrics$sigma_rider),
-    list(label = "$\\sigma_{\\varepsilon}$",  value = metrics$sigma_eps)
-  )
-  if (!is.null(metrics$extra_sigmas) && length(metrics$extra_sigmas) > 0) {
-    for (pc in names(metrics$extra_sigmas)) {
-      lbl <- if (pc == "source") "$\\sigma_{\\text{trip}}$" else
-             sprintf("$\\sigma_{\\text{%s}}$", pc)
-      sigmas_list <- c(sigmas_list,
-        list(list(label = lbl, value = metrics$extra_sigmas[[pc]])))
-    }
-  }
-
-  writeLines(.params_to_latex(params_df, model_name,
-                              equation = .build_equation_latex(params_df, mixed = TRUE, panel_cols = panel_cols),
-                              sigmas   = sigmas_list),
-             file.path(out_dir, paste0(model_name, "_params.tex")))
-  writeLines(.stats_to_latex(metrics, model_name),
-             file.path(out_dir, paste0(model_name, "_stats.tex")))
-  .plot_marginal_means(fit, params_df, data, model_name, out_dir, is_mixed = TRUE, raw_data = df_est)
-
-  invisible(list(fit = fit, params = params_df, metrics = metrics))
+                                   method = "ML",
+                                   robust = TRUE, cluster_col = "rider_id",
+                                   make_plots = TRUE, verbose = TRUE) {
+  run_mixed_linear_panel_ar(df_est, rhs, model_name,
+                            panel_id_col = panel_id_col,
+                            ar_order     = 0,
+                            method       = method,
+                            make_plots   = make_plots,
+                            robust       = robust,
+                            cluster_col  = cluster_col,
+                            verbose      = verbose)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -995,16 +879,24 @@ run_mixed_linear_panel <- function(df_est, rhs, model_name,
 # ══════════════════════════════════════════════════════════════════════════════
 run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
                                       panel_id_col = c("rider_id", "source"),
+                                      cor_id_col   = NULL,
                                       time_col     = "second",
                                       ar_order     = 1,
                                       method       = "ML",
-                                      make_plots   = TRUE) {
+                                      make_plots   = TRUE,
+                                      robust = TRUE, cluster_col = "rider_id",
+                                      verbose = TRUE) {
   use_reml   <- identical(toupper(method), "REML")
   panel_cols <- panel_id_col
+  # Groupes de la structure AR : par défaut identiques aux effets aléatoires.
+  # cor_id_col permet de les découpler (ex. random ~1|rider_id mais AR blocquée
+  # par trajet : panel_id_col="rider_id", cor_id_col=c("rider_id","source")).
+  cor_cols   <- if (is.null(cor_id_col)) panel_cols else unique(c(panel_cols, cor_id_col))
 
   formula_obj <- as.formula(paste0("speed_kmh_kalman_t1 ~ ", rhs))
 
-  vars_used <- unique(c("speed_kmh_kalman_t1", panel_cols, time_col,
+  vars_used <- unique(c("speed_kmh_kalman_t1", panel_cols, cor_cols,
+                        if (ar_order >= 1) time_col else NULL,
                         all.vars(as.formula(paste("~", rhs)))))
   vars_used <- vars_used[vars_used %in% names(df_est)]
   data      <- df_est[, vars_used, drop = FALSE]
@@ -1013,34 +905,62 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
   data    <- data[complete.cases(data), ]
   dropped <- before - nrow(data)
   if (dropped > 0) message(sprintf("[%s] ⚠ %d lignes supprimées (NaN)", model_name, dropped))
-  data <- data[do.call(order, c(data[panel_cols], list(data[[time_col]]))), ]
+  .ord_cols <- data[unique(c(panel_cols, cor_cols))]
+  if (ar_order >= 1) .ord_cols <- c(.ord_cols, list(data[[time_col]]))
+  data <- data[do.call(order, .ord_cols), ]
 
   N_obs    <- nrow(data)
   N_riders <- length(unique(data[[panel_cols[1]]]))
 
   # ── Structures aléatoire (emboîtée) et de corrélation AR(p) ─────────────────
   nested_grp  <- paste(panel_cols, collapse = "/")
-  ar_start    <- switch(as.character(ar_order), "1" = 0.8, "2" = c(0.5, 0.2), rep(0.2, ar_order))
+  cor_grp     <- paste(cor_cols,   collapse = "/")
+  ar_start    <- switch(as.character(ar_order), "0" = NULL, "1" = 0.8,
+                        "2" = c(0.5, 0.2), rep(0.2, ar_order))
+  # ar_order = 0 : aucune structure de corrélation (équivalent nlme d'un simple
+  # modèle à intercepts aléatoires) -> run_mixed_linear_panel délègue ici.
+  .cor_struct <- function(cgrp) {
+    if (ar_order < 1) return(NULL)
+    nlme::corARMA(ar_start, form = as.formula(paste("~", time_col, "|", cgrp)),
+                  p = ar_order, q = 0)
+  }
+
+  # ── Garde-fou : corARMA exige un temps UNIQUE dans chaque groupe de l'AR ────
+  # `second` repart à 0 à chaque trajet : si les groupes AR n'incluent pas la
+  # colonne trajet, les temps sont dupliqués et nlme échoue avec un message
+  # peu parlant ("covariate must have unique integer values within groups").
+  .dup <- ar_order >= 1 && anyDuplicated(data[, c(cor_cols, time_col), drop = FALSE]) > 0
+  if (.dup) {
+    stop(sprintf(paste0("[%s] `%s` n'est pas unique dans les groupes AR (~ %s | %s).\n",
+                        "  corARMA exige un temps unique par groupe. Ajoutez la colonne trajet\n",
+                        "  aux groupes AR sans toucher aux effets aléatoires, p. ex. :\n",
+                        "    panel_id_col = c(%s), cor_id_col = c(%s, \"source\")"),
+                 model_name, time_col, time_col, cor_grp,
+                 paste(sprintf('"%s"', panel_cols), collapse = ", "),
+                 paste(sprintf('"%s"', panel_cols), collapse = ", ")), call. = FALSE)
+  }
   ctrl        <- nlme::lmeControl(opt = "nlminb", maxIter = 300, msMaxIter = 300, returnObject = TRUE)
   reml_method <- if (use_reml) "REML" else "ML"
 
-  fit_one <- function(grp) {
+  fit_one <- function(grp, cgrp = cor_grp) {
     nlme::lme(formula_obj,
               random      = as.formula(paste("~ 1 |", grp)),
-              correlation = nlme::corARMA(ar_start,
-                              form = as.formula(paste("~", time_col, "|", grp)),
-                              p = ar_order, q = 0),
+              correlation = .cor_struct(cgrp),
               data = data, method = reml_method, control = ctrl)
   }
   used_panel <- panel_cols
-  fit <- tryCatch(fit_one(nested_grp), error = function(e) {
-    message(sprintf("[%s] emboîté non convergé (%s) → repli sur ~ 1 | %s",
-                    model_name, conditionMessage(e), panel_cols[length(panel_cols)]))
-    used_panel <<- panel_cols[length(panel_cols)]
-    fit_one(used_panel)
-  })
+  fit <- if (length(panel_cols) == 1) fit_one(nested_grp) else
+    tryCatch(fit_one(nested_grp), error = function(e) {
+      # Repli utile UNIQUEMENT si la structure aléatoire est emboîtée : sinon on
+      # refit à l'identique le modèle qui vient d'échouer.
+      message(sprintf("[%s] emboîté non convergé (%s) → repli sur ~ 1 | %s",
+                      model_name, conditionMessage(e), panel_cols[length(panel_cols)]))
+      used_panel <<- panel_cols[length(panel_cols)]
+      fit_one(used_panel)
+    })
 
-  phi <- as.numeric(coef(fit$modelStruct$corStruct, unconstrained = FALSE))
+  phi <- if (ar_order < 1) numeric(0) else
+           as.numeric(coef(fit$modelStruct$corStruct, unconstrained = FALSE))
 
   # ── Log-vraisemblance, ρ² et LRT vs nul (même structure RE + AR, β = μ) ──────
   ll <- as.numeric(logLik(fit)); k <- attr(logLik(fit), "df")
@@ -1048,9 +968,7 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
   fit_null <- tryCatch(
     nlme::lme(speed_kmh_kalman_t1 ~ 1,
               random      = as.formula(paste("~ 1 |", paste(used_panel, collapse = "/"))),
-              correlation = nlme::corARMA(ar_start,
-                              form = as.formula(paste("~", time_col, "|", paste(used_panel, collapse = "/"))),
-                              p = ar_order, q = 0),
+              correlation = .cor_struct(cor_grp),
               data = data, method = "ML", control = ctrl),
     error = function(e) NULL)
   if (!is.null(fit_null)) {
@@ -1075,13 +993,56 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
   sigma_rid <- re_sds[1]
   icc       <- sigma_rid^2 / (sum(re_sds^2) + sigma_eps^2)
 
+  # ── LRT sur les variances aléatoires (σ=0) en GARDANT l'AR ───────────────────
+  #    Équivalent nlme du ranova de M5. On refit chaque modèle nul (une variance
+  #    retirée) en conservant EXACTEMENT la même structure AR :
+  #      H0 σ_rider=0 : random ~1|innermost , AR groupée par innermost (trajet)
+  #      H0 σ_pc=0    : random sur les niveaux restants , AR sur la forme nichée
+  #    Tests au BORD (variance=0) ⇒ p-value chi²(1) NAÏVE (conservatrice), comme M5.
+  refit_ll <- function(rand_grp, cor_grp) tryCatch(as.numeric(logLik(
+    nlme::lme(formula_obj,
+              random      = as.formula(paste("~ 1 |", rand_grp)),
+              correlation = .cor_struct(cor_grp),
+              data = data, method = "ML", control = ctrl))),
+    error = function(e) NA_real_)
+
+  sigma_rider_lrt <- NA; sigma_rider_p <- NA
   extra_sigmas <- list(); extra_ns <- list(); extra_lrts <- list()
+  if (length(used_panel) == 1) {
+    # H0 : sigma_rider = 0 avec un seul niveau aléatoire -> gls (mêmes AR + betas)
+    ll_gls <- tryCatch(as.numeric(logLik(
+      nlme::gls(formula_obj,
+                correlation = .cor_struct(cor_grp),
+                data = data, method = "ML",
+                control = nlme::glsControl(maxIter = 300, msMaxIter = 300, returnObject = TRUE)))),
+      error = function(e) NA_real_)
+    if (!is.na(ll_gls)) {
+      sigma_rider_lrt <- round(max(0, -2 * (ll_gls - ll)), 2)
+      sigma_rider_p   <- pchisq(sigma_rider_lrt, df = 1, lower.tail = FALSE)
+    }
+  }
   if (length(used_panel) > 1) {
+    innermost <- used_panel[length(used_panel)]
+    full_grp  <- paste(used_panel, collapse = "/")
+    # H0 : σ_rider = 0 (retirer le 1er niveau ; AR groupée par l'innermost)
+    ll_no_rider <- refit_ll(innermost, innermost)
+    if (!is.na(ll_no_rider)) {
+      sigma_rider_lrt <- round(max(0, -2 * (ll_no_rider - ll)), 2)
+      sigma_rider_p   <- pchisq(sigma_rider_lrt, df = 1, lower.tail = FALSE)
+    }
+    # H0 : σ_pc = 0 pour chaque niveau supplémentaire (AR nichée conservée)
     for (j in seq_along(used_panel[-1])) {
       pc <- used_panel[j + 1]
       extra_sigmas[[pc]] <- if (length(re_sds) >= j + 1) round(re_sds[j + 1], 4) else NA
       extra_ns[[pc]]     <- length(unique(data[[pc]]))
-      extra_lrts[[pc]]   <- list(lrt = NA, p = NA)   # pas de ranova en nlme
+      grp_keep <- paste(setdiff(used_panel, pc), collapse = "/")
+      ll_no_pc <- refit_ll(grp_keep, full_grp)
+      if (!is.na(ll_no_pc)) {
+        st <- round(max(0, -2 * (ll_no_pc - ll)), 2)
+        extra_lrts[[pc]] <- list(lrt = st, p = pchisq(st, df = 1, lower.tail = FALSE))
+      } else {
+        extra_lrts[[pc]] <- list(lrt = NA, p = NA)
+      }
     }
   }
 
@@ -1101,12 +1062,24 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
     check.names  = FALSE, row.names = rownames(tt)
   )
 
+  if (isTRUE(verbose)) {
   cat(sprintf("\n%s\n", strrep("=", 72)))
-  cat(sprintf("  Mixed panel linear model + AR(%d): %s  [method: %s]\n", ar_order, model_name, toupper(method)))
-  cat(sprintf("  Panel: %s  |  temps: %s\n", paste(used_panel, collapse = " + "), time_col))
+  cat(sprintf("  Mixed panel linear model%s: %s  [method: %s]\n",
+              if (ar_order < 1) "" else sprintf(" + AR(%d)", ar_order),
+              model_name, toupper(method)))
+  cat(sprintf("  Panel: %s%s\n", paste(used_panel, collapse = " + "),
+              if (ar_order < 1) "" else sprintf("  |  temps: %s", time_col)))
   cat(sprintf("  Riders=%d  Observations=%d\n", N_riders, N_obs))
   cat(sprintf("  sigma_%s=%.4f  sigma_eps=%.4f\n", used_panel[1], sigma_rid, sigma_eps))
-  cat(sprintf("  phi (AR%d) = %s\n", ar_order, paste(sprintf("%.4f", phi), collapse = ", ")))
+  if (ar_order >= 1)
+    cat(sprintf("  phi (AR%d) = %s\n", ar_order, paste(sprintf("%.4f", phi), collapse = ", ")))
+  .st_trip <- if (!is.null(extra_lrts[["source"]])) extra_lrts[["source"]]$lrt else NA
+  .sp_trip <- if (!is.null(extra_lrts[["source"]])) extra_lrts[["source"]]$p   else NA
+  cat(sprintf("  LRT sigma_rider=0 : chi2(1)=%s (p=%s) | LRT sigma_trip=0 : chi2(1)=%s (p=%s)\n",
+              ifelse(is.na(sigma_rider_lrt), "---", sprintf("%.2f", sigma_rider_lrt)),
+              ifelse(is.na(sigma_rider_p),   "---", sprintf("%.4f", sigma_rider_p)),
+              ifelse(is.na(.st_trip),        "---", sprintf("%.2f", .st_trip)),
+              ifelse(is.na(.sp_trip),        "---", sprintf("%.4f", .sp_trip))))
   cat(sprintf("  Modèle nul      : LL=%s\n", if (is.na(ll_null)) "NA" else sprintf("%.2f", ll_null)))
   cat(sprintf("  Modèle principal: K=%d  LL=%.2f\n", k, ll))
   cat(sprintf("  Rm²=%.4f  Rc²=%.4f\n", r2_marginal, r2_conditional))
@@ -1134,6 +1107,7 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
     }
     cat("\n")
   }
+  }   # fin du bloc console (verbose)
 
   metrics <- list(
     Model = model_name, N = N_obs, N_riders = N_riders, K = k,
@@ -1144,7 +1118,8 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
     LRT_p = if (!is.na(lrt_p)) round(lrt_p, 4) else NA,
     r2_marginal = round(r2_marginal, 4), r2_conditional = round(r2_conditional, 4),
     sigma_rider = round(sigma_rid, 4), sigma_eps = round(sigma_eps, 4), ICC = round(icc, 4),
-    sigma_rider_lrt = NA, sigma_rider_p = NA,
+    sigma_rider_lrt = sigma_rider_lrt,
+    sigma_rider_p   = if (!is.na(sigma_rider_p)) round(sigma_rider_p, 4) else NA,
     extra_sigmas = extra_sigmas, extra_ns = extra_ns, extra_lrts = extra_lrts,
     phi = round(phi, 4), ar_order = ar_order
   )
@@ -1152,7 +1127,9 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
   # ── Sauvegardes (params.csv, params.tex, stats.tex, plots) ──────────────────
   out_dir <- .get_out_dir(model_name)
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  write.csv(params_df, file.path(out_dir, paste0(model_name, "_params.csv")))
+  robust_df <- if (isTRUE(robust)) .robust_params_df(fit, cluster_col) else NULL
+  write.csv(.merge_robust_csv(params_df, robust_df),
+            file.path(out_dir, paste0(model_name, "_params.csv")))
 
   sigmas_list <- list(list(label = "$\\sigma_{\\text{rider}}$", value = metrics$sigma_rider))
   if (length(metrics$extra_sigmas) > 0) {
@@ -1165,7 +1142,7 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
 
   writeLines(.params_to_latex(params_df, model_name,
                equation = .build_equation_latex(params_df, mixed = TRUE, panel_cols = used_panel),
-               sigmas   = sigmas_list),
+               sigmas   = sigmas_list, robust_df = robust_df),
              file.path(out_dir, paste0(model_name, "_params.tex")))
   writeLines(.stats_to_latex(metrics, model_name),
              file.path(out_dir, paste0(model_name, "_stats.tex")))
@@ -1179,4 +1156,56 @@ run_mixed_linear_panel_ar <- function(df_est, rhs, model_name,
   invisible(list(fit = fit, params = params_df, metrics = metrics))
 }
 
-cat("✔ Fonctions R chargées : run_linear, run_mixed_linear_panel, run_mixed_linear_panel_ar\n")
+# ══════════════════════════════════════════════════════════════════════════════
+# fit_mixed_nlme(df_est, rhs, panel_id_col, ...)
+#   Ajuste un modèle à intercepts aléatoires avec nlme::lme (SANS structure AR).
+#   Même modèle que run_mixed_linear_panel (lme4::lmer) mais sur le moteur nlme,
+#   pour que M5 et M6 soient comparables sans effet de changement de paquet.
+# ══════════════════════════════════════════════════════════════════════════════
+fit_mixed_nlme <- function(df_est, rhs, panel_id_col = "rider_id",
+                           method = "ML", target = "speed_kmh_kalman_t1") {
+  f  <- as.formula(paste(target, "~", rhs))
+  vs <- unique(c(target, panel_id_col, all.vars(as.formula(paste("~", rhs)))))
+  d  <- df_est[, vs[vs %in% names(df_est)], drop = FALSE]
+  for (cn in names(d)) if (is.character(d[[cn]])) d[[cn]] <- factor(d[[cn]])
+  before <- nrow(d); d <- d[complete.cases(d), ]
+  if (before > nrow(d)) message(sprintf("[fit_mixed_nlme] ⚠ %d lignes supprimées (NaN)",
+                                        before - nrow(d)))
+  nlme::lme(f,
+            random  = as.formula(paste("~ 1 |", paste(panel_id_col, collapse = "/"))),
+            data    = d,
+            method  = if (identical(toupper(method), "REML")) "REML" else "ML",
+            control = nlme::lmeControl(opt = "nlminb", maxIter = 300,
+                                       msMaxIter = 300, returnObject = TRUE))
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# print_robust_tp(fit, cluster_col, model_name)
+#   Affiche UNIQUEMENT le t et la p-value cluster-robustes CR2 (+ étoiles).
+#   S'appuie sur .robust_params_df (CR2 + dof de Satterthwaite) : aucune
+#   estimation n'est refaite, seules les colonnes affichées sont restreintes.
+#   Marche sur lme4::lmer comme sur nlme::lme.
+# ══════════════════════════════════════════════════════════════════════════════
+print_robust_tp <- function(fit, cluster_col = "rider_id", model_name = NULL,
+                            digits = 3, show_df = FALSE) {
+  pf <- .robust_params_df(fit, cluster_col)
+  if (is.null(pf)) {
+    message("[print_robust_tp] colonnes robustes indisponibles (clubSandwich ?)")
+    return(invisible(NULL))
+  }
+  st <- function(p) ifelse(is.na(p), "", ifelse(p < .001, "***", ifelse(p < .01, "**",
+                    ifelse(p < .05, "*", ifelse(p < .1, ".", "")))))
+  out <- data.frame(Terme = rownames(pf), check.names = FALSE,
+                    stringsAsFactors = FALSE)
+  if (isTRUE(show_df)) out[["df"]] <- round(pf[["df"]], 2)
+  out[["t robuste"]] <- round(pf[["t value"]], digits)
+  out[["p robuste"]] <- signif(pf[["Pr(>|t|)"]], digits)
+  out[[" "]]         <- st(pf[["Pr(>|t|)"]])
+  cat(sprintf("%s— t et p cluster-robustes CR2 (cluster = %s, %s clusters)\n\n",
+              if (is.null(model_name)) "" else paste0(model_name, " "),
+              cluster_col, attr(pf, "n_clusters")))
+  print(out, row.names = FALSE)
+  invisible(out)
+}
+
+cat("✔ Fonctions R chargées : run_linear, run_mixed_linear_panel, run_mixed_linear_panel_ar,\n  fit_mixed_nlme, print_robust_tp\n")

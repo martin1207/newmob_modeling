@@ -3,7 +3,9 @@ build_clean_dataset.py
 ─────────────────────────────────────────────────────────────────────────────
 Génère un dataset propre à partir des fichiers debug_encounters + IMU
 (e-scooter), enrichi de :
-  - la largeur de route perpendiculaire au trajet (road.gpkg)
+  - la largeur de route (méthode OBB : petit côté du rectangle orienté minimal
+    du polygone de rue contenant le point ; NaN hors rue). La colonne conserve
+    le nom `road_width_perp_m` pour compatibilité avec les scripts en aval.
   - les infos rider (genre, age, experience, nb trajets, distance)
     issues du fichier participants Excel
   - les variables temporelles issues du timestamp IMU / nom de fichier
@@ -101,28 +103,6 @@ except Exception as _e:
     GYRZ_LEFT_POSITIVE         = True
 
 
-def _selftest_distance_model():
-    """Force un appel sur une bbox factice pour valider tôt que le modèle
-    est utilisable. Affiche un diagnostic clair sinon."""
-    if _oa_predict_distances is None:
-        print("⚠  Modèle de distance NON disponible (import overlay_annotations échoué).")
-        return False
-    try:
-        out = _oa_predict_distances([(100, 100, 200, 300)])
-    except Exception as e:
-        print(f"⚠  Self-test distance : exception levée : {e}")
-        return False
-    if not out or out[0] is None:
-        print("⚠  Self-test distance : prédiction = None (joblib/sklearn manquants ?")
-        print("    → installer joblib + sklearn dans le Python qui exécute ce script,")
-        print(f"    → ou vérifier le bundle dans overlay_annotations.DISTANCE_MODEL_PATH.")
-        return False
-    print(f"✔  Modèle de distance opérationnel (test : {out[0]:.2f} m sur bbox factice)")
-    return True
-
-
-_DIST_MODEL_OK = _selftest_distance_model()
-
 
 # ── Géométrie caméra (azimut VRU) ────────────────────────────────────────────
 # FOV horizontale supposée constante : pas de calibration par clip chargée
@@ -133,11 +113,10 @@ HFOV_DEG       = 90.0
 # Focale équivalente (px) déduite du modèle sténopé : f = (W/2) / tan(HFOV/2)
 _FOCAL_PX = (IMAGE_WIDTH_PX / 2.0) / math.tan(math.radians(HFOV_DEG) / 2.0)
 
-
 # ── Mapping codes ────────────────────────────────────────────────────────────
 CODE_LABELS = {
     "CONFIRM":           {"0": "Reject", "1": "Accept", "2": "Review"},
-    "VRU_TYPE":          {"1": "Pedestrian", "2": "Cyclist", "3": "E-scooter",
+    "VRU_T YPE":          {"1": "Pedestrian", "2": "Cyclist", "3": "E-scooter",
                           "4": "Other MMV",  "5": "Motor",   "6": "Animal",
                           "7": "Stationary", "9": "Unknown"},
     "INTERACTION_TYPE":  {"1": "Same-direction", "2": "Opposite-direction",
@@ -213,7 +192,6 @@ def normalize_label(label: str) -> str:
 # appliqué aux colonnes Lat/Long/VitGPS des fichiers *_corrected_with_offset_
 # gpsfixed.csv. On n'applique donc plus aucun offset ici (0 = pas de décalage).
 GPS_OFFSET_FRAMES    = 0
-TURN_THRESHOLD_DEG_S = 20      # (déprécié) ancien seuil GyrZ d'exclusion des virages
 PERP_HALF_LENGTH     = 100
 DIRECTION_WINDOW     = 5
 
@@ -233,6 +211,13 @@ TURN_SIMPLIFY_TOL_M      = 8.0     # tolérance Douglas-Peucker (m) pour les seg
 # Pas de vidéo ouverte ici → on reprend le fallback de correct_encounters.py
 # (cap.get(CAP_PROP_FPS) or 30.0).
 VIDEO_FPS            = 30.0
+
+# Cadence de décimation des positions GPS avant le filtre de Kalman (Hz).
+# Les *_corrected_with_offset_gpsfixed.csv portent des positions
+# ré-échantillonnées à la cadence IMU (~100 Hz) ; sans décimation le filtre les
+# prend pour autant de fixes indépendants et sur-estime la vitesse. Le récepteur
+# délivre ~1 fix/s → 1.0. Mettre 0 pour retrouver le comportement d'avant.
+KALMAN_FIX_HZ        = 1.0
 
 # Tranches horaires : (label, heure_debut_incluse, heure_fin_exclue)
 TIME_SLOTS = [
@@ -267,6 +252,9 @@ def find_imu_candidates(prefix):
     )
 
 
+
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # HELPERS — Vitesse GPS par filtre de Kalman (position CV 2D + lisseur RTS)
 # Implémentation partagée dans kalman_speed.py (numpy pur), pour que la vitesse
@@ -277,15 +265,39 @@ def find_imu_candidates(prefix):
 import kalman_speed
 
 
-def kalman_gps_speed_kmh(imu, q=2.0, r=9.0):
+def kalman_gps_speed_kmh(imu, sigma_a=1.5, r=9.0, fix_hz=KALMAN_FIX_HZ):
     """Vitesse GPS Kalman (km/h) alignée sur l'index de `imu`. NaN là où le
-    trajet n'a pas de position GPS valide. Voir kalman_speed.gps_speed_kmh."""
+    trajet n'a pas de position GPS valide. Voir kalman_speed.gps_speed_kmh
+    (filtre identique au notebook, Q piloté par sigma_a m/s²).
+
+    `fix_hz` décime les positions à la cadence réelle du récepteur AVANT le
+    filtre (cf. KALMAN_FIX_HZ) ; `imu` reste à 100 Hz et la Series renvoyée
+    garde une valeur par ligne."""
     if not {"TimeStamp", "Lat", "Long"}.issubset(imu.columns):
         return pd.Series(np.nan, index=imu.index, dtype=float)
     v = kalman_speed.gps_speed_kmh(
-        imu["TimeStamp"].values, imu["Lat"].values, imu["Long"].values, q=q, r=r
+        imu["TimeStamp"].values, imu["Lat"].values, imu["Long"].values,
+        sigma_a=sigma_a, r=r, fix_hz=fix_hz
     )
     return pd.Series(v, index=imu.index, dtype=float)
+
+
+def pct_fix_dt_below(imu, thresh_s=0.02):
+    """% des fixes GPS bruts (avant décimation) espacés de moins de `thresh_s`.
+    Diagnostic du sur-échantillonnage des *_gpsfixed.csv : une valeur élevée
+    signale un clip dont la trace a été ré-échantillonnée à la cadence IMU."""
+    if not {"TimeStamp", "Lat", "Long"}.issubset(imu.columns):
+        return np.nan
+    t = pd.to_numeric(imu["TimeStamp"], errors="coerce").values / 1000.0
+    la = pd.to_numeric(imu["Lat"], errors="coerce").values
+    lo = pd.to_numeric(imu["Long"], errors="coerce").values
+    ok = np.isfinite(t) & np.isfinite(la) & np.isfinite(lo) & (np.abs(la) <= 90) & (lo != 0)
+    t, la, lo = t[ok], la[ok], lo[ok]
+    if len(t) < 5:
+        return np.nan
+    chg = np.concatenate([[True], (np.abs(np.diff(la)) + np.abs(np.diff(lo))) > 0])
+    ft = t[chg]
+    return round(100.0 * float((np.diff(ft) < thresh_s).mean()), 1) if len(ft) > 1 else np.nan
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -573,19 +585,7 @@ def load_enc_meta_full(enc_csv: str) -> dict:
 
 
 def load_vrus_with_distance(autodet_csv: str, enc_meta: dict) -> pd.DataFrame:
-    """Une ligne par détection autodetect dont (track_id, frame) ∈ enc_meta.
 
-    Bbox reconstruite comme dans overlay_annotations.py : w = 0.45 * h.
-    Distance prédite par le modèle joblib (batch). Colonnes :
-        frame, track_id, x1, y1, x2, y2, foot_x, foot_y, bbox_height, distance_m,
-        cx_px, azimuth_deg,
-        VRU_TYPE_LABEL, INTERACTION_LABEL,
-        VRU_AGE_GROUP_LABEL, VRU_GAIT_LABEL, VRU_GROUP_SIZE_LABEL
-
-    azimuth_deg : angle horizontal du VRU par rapport à l'axe avant de
-    l'e-scooter (modèle sténopé, FOV constante). Positif = à droite,
-    négatif = à gauche. Cf. constantes IMAGE_WIDTH_PX / HFOV_DEG.
-    """
     cols = [
         'frame', 'track_id', 'x1', 'y1', 'x2', 'y2',
         'foot_x', 'foot_y', 'bbox_height', 'distance_m', 'lateral_m',
@@ -1242,7 +1242,52 @@ road   = gpd.read_file(ROAD_GPKG)
 road_m = road.to_crs(epsg=2154).copy()
 sindex = road_m.sindex
 
-print(f"  {len(road_m)} polygones — CRS : {road_m.crs}\n")
+# ── Largeur OBB : petit côté du rectangle orienté minimal de chaque polygone ──
+# Remplace l'ancienne perpendiculaire de 200 m (méthode polygon_width_at_point),
+# qui gonflait la largeur en coupant obliquement et sommait les segments des
+# polygones concaves. Cf. recompute_road_width_obb.py. La largeur OBB est une
+# propriété INTRINSÈQUE du polygone (indépendante du point et de la direction).
+def _obb_short_side(geom):
+    try:
+        mrr = geom.minimum_rotated_rectangle
+        xs, ys = mrr.exterior.coords.xy
+        d1 = math.hypot(xs[1] - xs[0], ys[1] - ys[0])
+        d2 = math.hypot(xs[2] - xs[1], ys[2] - ys[1])
+        return float(min(d1, d2))
+    except Exception:
+        return np.nan
+
+road_m["obb_width_m"] = road_m.geometry.apply(_obb_short_side)
+
+# Types d'espace pris en compte pour la largeur : rue + place + parc (les riders
+# traversent aussi places et parcs, qui sont présents dans road.gpkg).
+ROAD_SPACE_TYPES = ("street", "park", "square")
+if "type" in road_m.columns:
+    _road_polys = road_m[road_m["type"].astype(str).str.lower().isin(ROAD_SPACE_TYPES)].copy()
+else:
+    _road_polys = road_m.copy()
+_road_sindex = _road_polys.sindex if len(_road_polys) else None
+
+# Tolérance de rattachement d'un point à un espace (m) : absorbe le bruit GPS et
+# le fait qu'on roule près du bord du polygone. Au-delà → vraiment hors réseau.
+ROAD_SNAP_TOL_M = 25.0
+
+
+def road_obb_width(point):
+    """Largeur OBB de l'espace (rue/place/parc) le PLUS PROCHE du point, si à
+    <= ROAD_SNAP_TOL_M (rattachement tolérant au bruit GPS : le point n'a pas
+    besoin d'être strictement DANS le polygone). NaN au-delà de la tolérance —
+    l'espace n'est alors pas dans le réseau, pas juste « à côté »."""
+    if _road_sindex is None or len(_road_polys) == 0:
+        return np.nan
+    cand = list(_road_sindex.intersection(point.buffer(ROAD_SNAP_TOL_M).bounds))
+    sub = _road_polys.iloc[cand] if cand else _road_polys
+    d = sub.geometry.distance(point)
+    jmin = d.idxmin()
+    return float(sub.loc[jmin, "obb_width_m"]) if d.loc[jmin] <= ROAD_SNAP_TOL_M else np.nan
+
+print(f"  {len(road_m)} polygones — CRS : {road_m.crs}"
+      f"  (largeur OBB médiane : {road_m['obb_width_m'].median():.1f} m)\n")
 
 
 def find_polygon_for_point(point, road_gdf, sindex):
@@ -1500,7 +1545,10 @@ for src, group in gdf.groupby("source"):
 
         dx = group.geometry.iloc[i_next].x - group.geometry.iloc[i_prev].x
         dy = group.geometry.iloc[i_next].y - group.geometry.iloc[i_prev].y
-        widths.append(polygon_width_at_point(point, polygon, dx, dy))
+        # Largeur OBB de l'espace (rue/place/parc) le plus proche (NaN hors réseau).
+        # dx/dy ne servent plus à la largeur (OBB = intrinsèque), mais restent
+        # utilisés pour la pente signée ci-dessous.
+        widths.append(road_obb_width(point))
 
         # Pente signée : projection du gradient (% par m) sur le vecteur
         # unitaire de déplacement → positif = montée dans le sens de circulation.
@@ -1663,11 +1711,14 @@ for enc_path in sorted(encounter_files):
         # Vitesse GPS lissée par Kalman position + RTS (cf. speed/§2), calculée
         # sur les fixes GPS du clip puis interpolée par ligne IMU. Se joint
         # ensuite comme speed_kmh (colonne speed_kmh_kalman).
+        pct_burst = pct_fix_dt_below(imu)
         imu["speed_kmh_kalman"] = kalman_gps_speed_kmh(imu)
         n_kal_ok = int(imu["speed_kmh_kalman"].notna().sum())
         print(f"   Kalman GPS : {n_kal_ok}/{len(imu)} lignes avec vitesse "
-              f"(moy {imu['speed_kmh_kalman'].mean():.1f} km/h)"
+              f"(moy {imu['speed_kmh_kalman'].mean():.1f} km/h, "
+              f"décimation {KALMAN_FIX_HZ or 0:g} Hz)"
               if n_kal_ok else "   Kalman GPS : aucune position exploitable")
+        print(f"   Sur-éch.   : {pct_burst}% des fixes bruts espacés de <20 ms")
 
         imu["frame_corrected"] = imu["frame"] - GPS_OFFSET_FRAMES
 
